@@ -22,7 +22,7 @@ heterogeneous instances. Flags without that marker remain run-wide. See
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cluster-config` | path | `configs/cluster/single_node_single_instance.json` | Path to a cluster-config JSON. See **[Cluster config](./cluster-config)** |
-| `--network-backend` | choice | `analytical` | Network simulation backend. `analytical` (fast) or `ns3` (detailed, WIP) |
+| `--network-backend` | choice | `analytical` | Network simulation backend: `analytical` (fast) or `ns3` (packet-level) |
 
 ## Batching and scheduling
 

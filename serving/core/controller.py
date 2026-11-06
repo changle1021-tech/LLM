@@ -30,6 +30,9 @@ class Controller():
         out = [""]
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
             line = p.stdout.readline()
+            if not line:
+                error = p.stderr.read()[-4000:] if p.stderr is not None and p.poll() is not None else ''
+                raise RuntimeError(f'ASTRA-Sim closed stdout before Waiting (exit={p.poll()}): {error} {"".join(out[-20:])}')
             # For debugging
             # print(line, end='')
             out.append(line)
@@ -38,7 +41,10 @@ class Controller():
     def check_end(self, p):
         out = ["",""]
         while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError(f'ASTRA-Sim closed stdout before its completion report (exit={p.poll()})')
+            out.append(line)
             p.stdout.flush()
         print(out[-4], end='')
         print(out[-2], end='')

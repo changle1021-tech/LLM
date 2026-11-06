@@ -25,8 +25,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 - State the MIT License in the website footer and contributor welcome page,
   matching the repository's `LICENSE`; both previously said Apache 2.0.
-- Delay an ASTRA-Sim instance's tail-rank completion report until every rank
-  has completed the same workload iteration. Rank-local work after the final
+- Delay an ASTRA-Sim instance's tail-rank completion report in both analytical
+  and ns-3 backends until every rank has completed the same workload iteration.
+  Rebuild the ns-3 executable to apply the fix. Rank-local work after the final
   TP collective can no longer let faster boundary ranks retire a batch, free
   its scheduler state and under-report latency while a middle rank is still
   running. PP lookahead remains available because ranks already executing a

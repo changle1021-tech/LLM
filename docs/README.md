@@ -70,6 +70,7 @@ Distinguish accepted arguments from applied behavior and explicit refusals.
 | Flat benchmark inputs, workload generation and agentic simulation boundaries | [ShareGPT generator](docs/workloads/sharegpt-generators.md) and [agentic sessions](docs/workloads/agentic-sessions.md) |
 | Kimi/native DeepSeek duration replay versus ordinary serving | [Trace generation](docs/simulator/trace-generation.md) |
 | Logical bytes, native MoE payloads and unsupported traffic/capacity claims | [Trace format](docs/reference/trace-format.md) |
+| Per-instance completion barriers and PP lookahead in analytical and ns-3 backends | [Parallelism mechanics](docs/simulator/parallelism-mechanics.md#instance-completion-across-ranks) |
 | Official reference scopes and all latency statistics | [Validation](docs/validation.md) |
 | Submodule publication and repeatable regression checks | [PR workflow](docs/contributor/pr-workflow.md) and [validation workflow](docs/contributor/validating-changes.md) |
 

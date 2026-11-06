@@ -2187,6 +2187,18 @@ multiple instances with the same `dp_group`.
 - `astra-sim/inputs/system/system.json` — scheduling policy and memory bandwidth
 - `astra-sim/inputs/memory/memory_expansion.json` — remote (CPU) memory config
 
+### Instance completion across network backends
+
+The analytical and ns-3 serving drivers share the head/tail completion contract.
+Before reporting a tail rank's iteration, check every rank in that instance:
+its iteration must be later than the target, or equal to the target with
+`is_finished` set. Checking only the boundary ranks can retire a batch while
+a middle rank still runs its local tail. Requiring all ranks to be idle would
+instead block PP lookahead. Keep the barrier local to the instance, preserve
+head-rank admission, and rebuild the ns-3 executable after changing its driver.
+Validate with a slower middle rank and with a managed rank already executing
+the next iteration; completion must wait only for the target iteration.
+
 ### Working directory
 Run `python -m serving` from the repository root. The entry point changes cwd
 to `astra-sim/` internally, but relative cluster, dataset, output and gate-stat

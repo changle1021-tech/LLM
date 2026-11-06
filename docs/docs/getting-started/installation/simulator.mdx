@@ -102,11 +102,27 @@ That is the exact path `serving/__main__.py` launches as a subprocess,
 so if it exists and is executable, the build worked.
 
 :::tip[ns3 backend]
-`compile.sh` has a commented-out block for the ns3 backend
-(packet-level network simulation). Most users don't need it. Uncomment
-it only if you intend to pass `--network-backend ns3`, which launches a
-different binary:
-`astra-sim/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default`.
+The packet-level ns-3 backend is built separately from the default
+analytical backend. From the simulator container, run:
+
+```bash
+scripts/compile.sh --backend ns3 --jobs 4
+```
+
+This builds
+`astra-sim/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-optimized`,
+which `python -m serving --network-backend ns3` launches. In the tested
+Docker setup, Chakra was installed in advance as root with `pip install
+--no-deps` (protobuf 7.36.2 was present), then compilation ran as UID 1001
+with `--skip-chakra-install`:
+
+```bash
+scripts/compile.sh --backend ns3 --jobs 4 --skip-chakra-install
+```
+
+That privilege split is one tested setup, not a universal Chakra or protobuf
+version requirement. See [ns-3 backend](/docs/simulator/ns3-backend) for
+topology configuration and validation details.
 :::
 
 ## 4. Verify the install

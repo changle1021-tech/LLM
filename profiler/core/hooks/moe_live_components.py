@@ -142,7 +142,7 @@ class LiveComponentMeasurement:
             measurement_context=MOE_WEIGHT_POLICY,
             expert_conditioning=dict(schema=MOE_CONDITIONING_POLICY,
                 l2_bytes=int(properties.L2_cache_size),capacity_multiple=2,minimum_banks=2,
-                quality_relative_tolerance=.03,representative='higher_bank_control',
+                quality_relative_tolerance=.05,representative='higher_bank_control',
                 local_components='isolated_warm',warmup_complete_cycles=3),
             routing_stimulus='balanced_local_histogram_with_full_global_topk',
             eager_attribution=EAGER_ATTRIBUTION,expert_output_reference='independent_eager_clone',

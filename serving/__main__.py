@@ -35,6 +35,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.ns3_config import prepare_ns3_inputs
 import sys as flush
 
 from pyinstrument import Profiler
@@ -138,38 +139,6 @@ def _cleanup_inputs_root(run_paths, logger):
         return
     shutil.rmtree(inputs_root, ignore_errors=True)
     logger.info("Removed ASTRA-Sim inputs root: %s", inputs_root)
-
-
-def _prepare_ns3_config(astra_sim, run_paths):
-    template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
-    output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
-    config_path = os.path.join(run_paths.inputs_root, "ns3", "config.txt")
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-
-    replacements = {
-        "FLOW_FILE": os.path.join(output_dir, "flow.txt"),
-        "TRACE_FILE": os.path.join(output_dir, "trace.txt"),
-        "TRACE_OUTPUT_FILE": os.path.join(output_dir, "mix.tr"),
-        "FCT_OUTPUT_FILE": os.path.join(output_dir, "fct.txt"),
-        "PFC_OUTPUT_FILE": os.path.join(output_dir, "pfc.txt"),
-        "QLEN_MON_FILE": os.path.join(output_dir, "qlen.txt"),
-    }
-
-    for path in (replacements["FLOW_FILE"], replacements["TRACE_FILE"]):
-        open(path, "w").close()
-
-    with open(template, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        for line in lines:
-            parts = line.split(maxsplit=1)
-            if parts and parts[0] in replacements:
-                f.write(f"{parts[0]} {replacements[parts[0]]}\n")
-            else:
-                f.write(line)
-    return config_path
 
 
 def _iter_raw_instances(cluster_config):
@@ -640,7 +609,7 @@ def main():
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], default='WARNING',
                         help='logging verbosity: WARNING (minimal), INFO (per-iteration details), DEBUG (per-layer memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
-                        help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+                        help='network simulation backend: analytical (fast, default) or ns3 (packet network)')
 
     args = parser.parse_args()
     
@@ -711,8 +680,9 @@ def main():
         network=run_paths.network_config
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
     elif network_backend == 'ns3':
-        network=_prepare_ns3_config(astra_sim, run_paths)
-        binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
+        network, logical_topology = prepare_ns3_inputs(
+            astra_sim, run_paths, cluster, raw_cluster_config.get("ns3"))
+        binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-optimized")
     else:
         raise NotImplementedError("Only analytical and ns3 network backend are supported")
     memory=run_paths.memory_config
@@ -908,8 +878,15 @@ def main():
     if end_npu_ids != "":
         astra_args.append("--end-npu-ids="+end_npu_ids)
     if network_backend == 'ns3':
-        astra_args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
-    p = subprocess.Popen(astra_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        astra_args.append("--logical-topology-configuration="+logical_topology)
+        ns3_options = raw_cluster_config.get('ns3') or {}
+        astra_args.append('--host-dispatch-latency-ns='+str(ns3_options.get('host_dispatch_latency_ns', 0)))
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        raise FileNotFoundError(f'Backend executable is missing: {binary}; run scripts/compile.sh --backend {network_backend}')
+    p = subprocess.Popen(astra_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=(subprocess.STDOUT if network_backend == 'ns3' else subprocess.PIPE),
+                         cwd=(run_paths.inputs_root if network_backend == 'ns3' else None),
+                         universal_newlines=True)
 
     # DP group synchronization: defer trace generation until all members have scheduled
     # dp_groups maps dp_group_name -> list of instance_ids
@@ -1484,6 +1461,9 @@ def main():
 
     # check all scheduled requests in astra-sim are well done
     controller.check_end(p)
+    backend_exit = p.wait(timeout=30)
+    if backend_exit != 0:
+        raise RuntimeError(f'ASTRA-Sim exited with status {backend_exit}')
 
     # calcuate prefix caching metrics
     total_requested_tokens = 0

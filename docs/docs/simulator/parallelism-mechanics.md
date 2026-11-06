@@ -168,14 +168,19 @@ the rank-specific `.et` files out to managed ranks; the last rank is the
 completion signal consumed by `Scheduler.add_done()`. This is a control-plane
 role, not a data dependency between TP ranks.
 
-The tail rank reports iteration *k* only after every rank in that instance has
-completed iteration *k*. A managed rank can already be running a later
+In both analytical and ns-3 backends, the tail rank reports iteration *k* only
+after every rank in that instance has completed iteration *k*. A managed rank
+can already be running a later
 iteration because PP keeps several batches in flight; its monotonically
 increasing iteration number proves that it completed *k*. A rank still running
 *k* blocks the tail report even if the first and last ranks have drained their
 own graphs. The reported clock is therefore the group makespan rather than the
 finish time of an arbitrarily chosen boundary rank, without removing PP
 lookahead or adding one frontend handshake per rank.
+
+The barrier covers one instance's target iteration; it does not wait for other
+instances or for all ranks to become idle. Rebuild the ns-3 executable after
+updating the serving driver so it enforces the same completion contract.
 
 ## EP, the all-to-all around the MoE block
 

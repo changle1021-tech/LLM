@@ -2,6 +2,11 @@
     "num_nodes": 1,
     "link_bw": 16,
     "link_latency": 20000,
+    "ns3": {
+        "links": [
+            {"src": 0, "dst": 1, "bandwidth_gbps": 137.438953472, "latency_ns": 10000}
+        ]
+    },
     "nodes": [
         {
             "num_instances": 2,

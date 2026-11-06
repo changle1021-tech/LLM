@@ -1,0 +1,143 @@
+{
+  "num_nodes": 1,
+  "nodes": [
+    {
+      "num_instances": 4,
+      "cpu_mem": {
+        "mem_size": 1024,
+        "mem_bw": 512,
+        "mem_latency": 0
+      },
+      "instances": [
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0,
+            "mem_util": 0.9
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 4,
+          "dp_group": "A",
+          "pd_type": null,
+          "cudagraph": {
+            "runner": "v2",
+            "mode": "FULL_AND_PIECEWISE",
+            "capture_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16
+            ],
+            "enable_sp": false
+          },
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 1024,
+          "block_size": 16,
+          "enable_chunked_prefill": true,
+          "enable_prefix_caching": true
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0,
+            "mem_util": 0.9
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 4,
+          "dp_group": "A",
+          "pd_type": null,
+          "cudagraph": {
+            "runner": "v2",
+            "mode": "FULL_AND_PIECEWISE",
+            "capture_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16
+            ],
+            "enable_sp": false
+          },
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 1024,
+          "block_size": 16,
+          "enable_chunked_prefill": true,
+          "enable_prefix_caching": true
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0,
+            "mem_util": 0.9
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 4,
+          "dp_group": "A",
+          "pd_type": null,
+          "cudagraph": {
+            "runner": "v2",
+            "mode": "FULL_AND_PIECEWISE",
+            "capture_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16
+            ],
+            "enable_sp": false
+          },
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 1024,
+          "block_size": 16,
+          "enable_chunked_prefill": true,
+          "enable_prefix_caching": true
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0,
+            "mem_util": 0.9
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 4,
+          "dp_group": "A",
+          "pd_type": null,
+          "cudagraph": {
+            "runner": "v2",
+            "mode": "FULL_AND_PIECEWISE",
+            "capture_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16
+            ],
+            "enable_sp": false
+          },
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 1024,
+          "block_size": 16,
+          "enable_chunked_prefill": true,
+          "enable_prefix_caching": true
+        }
+      ]
+    }
+  ]
+}
