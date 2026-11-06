@@ -16,6 +16,9 @@ def component_names(contract):
         expected = ('gate_routing', 'experts', 'wrapper')
     elif schema == 'native-modular-expert-region':
         expected = target.components
+    elif schema in ('native-distributed-fp8-expert-region',
+                    'native-distributed-mxfp4-expert-region'):
+        expected = target.components
     else:
         raise ValueError('Unknown native expert component boundary')
     if contract.get('components') != list(expected):

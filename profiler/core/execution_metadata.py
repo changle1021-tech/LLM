@@ -82,12 +82,37 @@ def _contains(observed, declared):
 def bind_model_config(observed, declared, resolved_declared):
     """Bind a declaration only after its native config class resolved aliases.
 
-    The worker supplies resolved_declared from its installed config class; the
-    offline consumer needs no Transformers dependency or model-specific aliases.
+    The worker supplies resolved_declared from its installed config resolver;
+    offline consumers need no Transformers dependency or model-specific aliases.
     """
     if not _contains(model_dimensions(observed), model_dimensions(resolved_declared)):
         raise ValueError('Serving model overrides differ from the declared model config')
     return model_dimensions(declared)
+
+
+def bind_native_model_config(model, declared):
+    """Bind the declaration after native HF and quantization resolution.
+
+    Keep the existing config-class path when it matches. Some native loaders
+    resolve checkpoint quantization aliases after HF construction; use an
+    independent ModelConfig for that declaration, without live HF overrides.
+    No weights, tokenizer or engine are loaded by this configuration step.
+    """
+    observed = model.hf_config.to_dict()
+    resolved = type(model.hf_config).from_dict(deepcopy(declared)).to_dict()
+    if _contains(model_dimensions(observed), model_dimensions(resolved)):
+        return bind_model_config(observed, declared, resolved)
+
+    from tempfile import TemporaryDirectory
+    from vllm.config import ModelConfig
+
+    with TemporaryDirectory(prefix='llmsim-execution-config-') as directory:
+        (Path(directory) / 'config.json').write_text(json.dumps(declared))
+        native = ModelConfig(model=directory, dtype=model.dtype,
+            max_model_len=model.max_model_len, enforce_eager=model.enforce_eager,
+            skip_tokenizer_init=True)
+        resolved = native.hf_config.to_dict()
+    return bind_model_config(observed, declared, resolved)
 
 
 def precision_scope(model_config, activation_dtype=None, kv_cache_dtype=None,

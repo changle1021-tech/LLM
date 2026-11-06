@@ -37,7 +37,7 @@ class Scheduler:
                  enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
                  npu_memory_utilization=1.0, reserve_full_isl=True,
-                 acceptance_model=None, async_scheduling=True):
+                 acceptance_model=None, async_scheduling=True, native_page_pool=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -73,7 +73,7 @@ class Scheduler:
         # under ``configs/model/`` is on it, and a snapshot of a list that moves
         # every release would drift silently, so adding one from that list means
         # revisiting this. It matters only for ``_async_adds_a_batch``.
-        self._uses_v2_model_runner = (not _is_moe) and (not _is_hybrid)
+        self._uses_v2_model_runner = native_page_pool is not None or ((not _is_moe) and (not _is_hybrid))
         self._needs_mamba_aligned_split = bool(enable_prefix_caching) and _is_hybrid
         if self._needs_mamba_aligned_split and not enable_chunked_prefill:
             # vLLM asserts this, in the same block that picks "align"
@@ -140,7 +140,8 @@ class Scheduler:
                                   pp_size=pp_size, kv_cache_dtype=kv_cache_dtype,
                                   npu_memory_utilization=npu_memory_utilization,
                                   num_speculative_tokens=(
-                                      acceptance_model.N if acceptance_model else 0))
+                                      acceptance_model.N if acceptance_model else 0),
+                                  native_page_pool=native_page_pool)
         self.kv = self.memory.kv
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)

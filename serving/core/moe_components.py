@@ -19,7 +19,7 @@ from profiler.core.moe_geometry import ExpertPlacement
 from profiler.core.bundle_metadata import read_tp
 from profiler.core.metadata_names import (
     EAGER_ATTRIBUTION, GRAPH_ATTRIBUTION, MOE_CONDITIONING_POLICY)
-from .communication import dtype_bytes
+from .communication import dtype_bytes, moe_dispatch_payload_bytes
 
 
 class MoeCoverageError(ValueError):
@@ -203,6 +203,8 @@ class MoeComponentTable:
         self.components = component_names(contract)
         region = contract['expert_region']
         self.live = region['schema'] == 'native-live-expert-region'
+        distributed_fp8 = region['schema'] == 'native-distributed-fp8-expert-region'
+        distributed_mxfp4 = region['schema'] == 'native-distributed-mxfp4-expert-region'
         if self.live:
             capabilities = contract.get('native_capabilities')
             unsupported = {'deferred', 'has_bias', 'lora', 'eplb', 'redundant_experts',
@@ -235,6 +237,15 @@ class MoeComponentTable:
             if (region.get('hidden_dim') != contract['expert_hidden_dim']
                     or region.get('intermediate_size') != contract['expert_intermediate_size']):
                 raise ValueError('Live expert tensor geometry differs from the component contract')
+        elif distributed_fp8 or distributed_mxfp4:
+            # Only the gate bytes and the dispatch layout enter the timing.
+            if (not self.independent_assignments
+                    or not isinstance(contract.get('dispatch_layout'), dict)
+                    or type(contract.get('gate_routing_weight_bytes')) is not int
+                    or type(contract.get('gate_weight_bytes')) is not int
+                    or contract['gate_routing_weight_bytes'] < contract['gate_weight_bytes']):
+                raise ValueError('Distributed expert components lack sampled routing, '
+                                 'dispatch layout or gate weight bytes')
         elif target.dp == 1 and contract.get('local_execution') != dict(
                 prepare='identity', finalize='output_alias_noop', expert_output_alias=True):
             raise ValueError('DP1 requires verified identity preparation and aliased no-op finalization')
@@ -259,7 +270,8 @@ class MoeComponentTable:
                 or (not self.live and contract['expert_weight_bytes'] % contract['local_experts'])):
             raise ValueError('Invalid native component dtype or measured weight-byte contract')
         gate_matrix = contract['global_experts']*gate_hidden*dtype_bytes(gate_dtype)
-        if (gate_bytes < gate_matrix if self.live else gate_bytes != gate_matrix):
+        moe_dispatch_payload_bytes(contract)
+        if (gate_bytes < gate_matrix if self.live or distributed_fp8 or distributed_mxfp4 else gate_bytes != gate_matrix):
             raise ValueError('Measured gate storage does not cover its projection matrix')
         checksum = hashlib.sha256(table.read_bytes()).hexdigest()
         if checksum != coverage['table_sha256'] or (not embedded and checksum != entry['table_sha256']):

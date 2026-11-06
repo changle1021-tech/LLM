@@ -259,6 +259,81 @@ def _kimi_attn_types(cfg: dict[str, Any], n: int) -> list[str]:
             raise ValueError("Kimi full_attention_interval contradicts its native attention schedule")
     return expected[:n]
 
+def _deepseek_v41_attn_types(cfg: dict[str, Any], n: int) -> list[str]:
+    """Map the native V4.1 source schedule to the catalog's block names.
+
+    vLLM 0.31 deepseek_v41/attention.py creates compressors on KV sources
+    and indexers on index sources; nvidia/model.py separates the first mHC
+    pre from Engram injection and the ordinary shifted post/pre.
+    These names describe composition, not ratio-specific latency classes.
+    """
+    depth = cfg.get("num_hidden_layers")
+    if type(depth) is not int or depth < 1:
+        raise ValueError("Deepseek_v41 num_hidden_layers must be a positive integer")
+    if type(n) is not int or not 1 <= n <= depth:
+        raise ValueError("Deepseek_v41 prefix must be within the original model depth")
+
+    ratios = cfg.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) < depth:
+        raise ValueError("Deepseek_v41 compress_ratios must cover the decoder depth")
+    if any(type(value) is not int or value not in (0, 1, 2) for value in ratios):
+        raise ValueError("Deepseek_v41 compress_ratios must contain only 0, 1 or 2")
+
+    def layer_ids(name):
+        values = cfg.get(name)
+        if values is None:
+            return set()
+        # A materialized profiling prefix retains the original schedules,
+        # including source IDs beyond its reduced num_hidden_layers.
+        if (not isinstance(values, list)
+                or any(type(value) is not int or not 0 <= value < len(ratios)
+                       for value in values)
+                or len(set(values)) != len(values)):
+            raise ValueError(f"Deepseek_v41 {name} must contain unique valid layer IDs")
+        return set(values)
+
+    kv_sources = layer_ids("kv_source_layer_ids")
+    index_sources = layer_ids("index_source_layer_ids")
+    engram_layers = layer_ids("engram_layer_ids")
+    expected = []
+    kv_source = index_source = None
+    for i in range(depth):
+        ratio = ratios[i]
+        owns_kv = i in kv_sources
+        owns_index = i in index_sources
+        engram = i in engram_layers
+        if owns_kv:
+            kv_source = i
+        if owns_index:
+            index_source = i
+
+        if ratio == 0:
+            if owns_kv or owns_index:
+                raise ValueError(f"Deepseek_v41 SWA layer {i} cannot own compressed sources")
+            if i == 0 and not engram:
+                kind = "swa_initial"
+            elif i > 0 and engram:
+                kind = "swa_engram"
+            else:
+                raise ValueError(f"Deepseek_v41 SWA layer {i} has no matching catalog block")
+        else:
+            if (kv_source is None or index_source is None
+                    or ratios[kv_source] != ratio or ratios[index_source] != ratio):
+                raise ValueError(f"Deepseek_v41 layer {i} requires compatible preceding KV/index sources")
+            if i == 0 or (owns_kv and not owns_index) or (engram and not owns_kv):
+                raise ValueError(f"Deepseek_v41 compressed layer {i} has no matching catalog block")
+            if owns_kv:
+                kind = "compressed_source_engram" if engram else "compressed_source"
+            elif owns_index:
+                kind = "compressed_index_source"
+            else:
+                kind = "compressed_reuse"
+        expected.append(kind)
+
+    if "layer_types" in cfg and cfg["layer_types"] != expected:
+        raise ValueError("Deepseek_v41 layer_types contradicts its native source schedule")
+    return expected[:n]
+
 
 def _attn_types(cfg: dict[str, Any], n: int) -> list[str]:
     """Attention type per layer.
@@ -273,6 +348,8 @@ def _attn_types(cfg: dict[str, Any], n: int) -> list[str]:
     """
     if cfg.get("model_type") in ("kimi_k3", "kimi_linear"):
         return _kimi_attn_types(cfg, n)
+    if cfg.get("model_type") in ("deepseek_v41", "deepseek_v41_text"):
+        return _deepseek_v41_attn_types(cfg, n)
     declared = cfg.get("layer_types")
     if isinstance(declared, list):
         # A config may declare more entries than the (possibly shrunk) layer

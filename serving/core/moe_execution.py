@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from profiler.core.moe_deployment import MoeTarget
-from .communication import dtype_bytes
+from .communication import dtype_bytes, moe_dispatch_payload_bytes
 from .config_builder import get_device
 from .logger import get_logger
 from .moe_components import MoeComponentTable, MoeCoverageError, component_index
@@ -22,6 +22,8 @@ def _warn(ctx, reason):
 
 def _legacy_fallback(ctx, reason, *, warn=True):
     """Only retained whole-block data can provide historical fallback."""
+    if getattr(ctx, 'attention_sequence_parallel', False):
+        raise MoeCoverageError('Attention-wide SP requires matching native MoE components: ' + reason)
     if 'legacy_moe_present' not in ctx.perf_db:
         tps = ctx.perf_db['available_tps']
         legacy_tp = 1 if 1 in tps else tps[0]
@@ -68,6 +70,9 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
     if ctx.tp_size > 1 and dp > 1 and type(entry.get('sequence_parallel')) is not bool:
         raise ValueError('TP+DP MoE needs an audited sequence-parallel catalog flag')
     sp = bool(ctx.tp_size > 1 and dp > 1 and entry.get('sequence_parallel'))
+    attention_sp = bool(getattr(ctx, 'attention_sequence_parallel', False))
+    if attention_sp and not sp:
+        raise ValueError('Attention-wide SP and native MoE token domains disagree')
     expected = dict(model=ctx.model, hardware=ctx.hardware, variant=ctx.perf_db['variant'],
                     global_experts=ctx.gate.E, global_top_k=ctx.gate.k,
                     hidden_dim=ctx.config['hidden_size'],
@@ -100,7 +105,18 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
     if mode_value not in (0,1,2):
         raise ValueError('Unknown model-forward execution mode')
     local, gathered = domain['gate_rows'], domain['expert_rows']
-    routing = ctx.gate.route_ep(layer_num, batch_id, gathered, ctx.ep_total, native=True)
+    routing_rows = gathered
+    if attention_sp:
+        record = ctx.perf_db['meta']['engram_execution']['per_tp'][str(ctx.tp_size)]
+        if record.get('moe_skip_padding', False):
+            valid = ctx.dp_valid_token_counts
+            if len(valid) != dp or any(type(n) is not int or not 0 <= n <= total
+                                       for n, total in zip(valid, counts)):
+                raise ValueError('SP MoE requires the complete unpadded DP token vector')
+            routing_rows = sum(valid)
+            if routing_rows != gathered and any(not table.independent_assignments for table in tables):
+                raise MoeCoverageError('SP padding masks require independently measured expert assignment counts')
+    routing = ctx.gate.route_ep(layer_num, batch_id, routing_rows, ctx.ep_total, native=True)
     h, k = expected['hidden_dim'], expected['global_top_k']
     weight_loc = get_device(ctx.placement, layer_num, 'moe', 'weights')
     parts = []
@@ -112,8 +128,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         contract = table.contract
         if dtype_bytes(contract['input_dtype']) != ctx.fp:
             raise ValueError('Native MoE activation dtype differs from runtime')
-        this_payloads = (h*ctx.fp, k*dtype_bytes(contract['topk_weights_dtype']),
-                         k*dtype_bytes(contract['topk_ids_dtype']))
+        this_payloads = moe_dispatch_payload_bytes(contract)
         if payloads is not None and this_payloads != payloads:
             raise ValueError('MoE ranks disagree on dispatch tensor dtypes')
         payloads = this_payloads
@@ -126,7 +141,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         expert_bytes = contract.get('expert_weight_bytes')
         if type(gate_bytes) is not int or type(expert_bytes) is not int:
             raise ValueError('Native MoE profile must record measured component weight sizes')
-        weights = dict(gate_routing=gate_bytes, experts=expert_bytes,
+        weights = dict(gate_routing=contract.get('gate_routing_weight_bytes', gate_bytes), experts=expert_bytes,
                        finalize_copy=0, wrapper=contract.get('wrapper_weight_bytes', 0))
         widths = dict(gate_routing=contract.get('gate_hidden_dim', h),
                       experts=contract.get('expert_hidden_dim', h), finalize_copy=h, wrapper=h)
@@ -155,7 +170,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         dispatch = ' '.join(_collective('ALLGATHER',dispatch_dims,size) for size in dispatch_sizes)
         combine = _collective('REDUCESCATTER',dispatch_dims,combine_size)
     restore = 'NONE 0'
-    if ctx.tp_size > 1:
+    if ctx.tp_size > 1 and not attention_sp:
         restore = _collective('ALLGATHER' if sp else 'ALLREDUCE',ctx.tp_dim,local*h*ctx.fp)
 
     # DP1 has no dispatch/combine or finalize copy. The final expert marker
@@ -185,7 +200,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         power_acc.link_data_bytes += sum(total_ring_data(s,group_size,collective='allgather') for s in dispatch_sizes)
         if dp > 1:
             power_acc.link_data_bytes += total_ring_data(combine_size,group_size,collective='reducescatter')
-        if ctx.tp_size > 1:
+        if ctx.tp_size > 1 and not attention_sp:
             power_acc.link_data_bytes += total_ring_data(local*h*ctx.fp,ctx.tp_size,
                 collective='allgather' if sp else 'allreduce')
     return True

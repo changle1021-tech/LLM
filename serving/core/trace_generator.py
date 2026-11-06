@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import sys
 from .request import *
@@ -10,7 +11,7 @@ from .utils import (
 import pandas as pd
 import yaml
 from .memory_model import calculate_sizes, kv_element_bytes
-from .communication import dtype_bytes, vocab_shard_size
+from .communication import dtype_bytes, vocab_shard_size, engram_tp_geometry, sequence_parallel_rows
 from .gate_function import GateRouter
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
@@ -120,8 +121,11 @@ class TraceCtx:
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
     dp_min_total_len: int  # smallest member's total_len in the DP round (0 = DP inactive). Only the EP collectives read it: they are ragged, so their cost is set by the worst-off rank, not the average one. Equals max on a padded round.
     dp_token_counts: tuple = ()  # Authoritative padded model rows in DP-rank order.
+    dp_valid_token_counts: tuple = ()  # Unpadded real tokens; dummy members contribute zero.
     component_sizes: object = None  # Explicit selected-runtime logical boundaries.
     duration_replay_only: bool = False  # Explicitly bypasses any serving/capacity support claim.
+    attention_sequence_parallel: bool = False
+    native_operator_weights: object = None
 
 
 @dataclass
@@ -156,6 +160,7 @@ class BatchCtx:
     decode_lens: list   # per-PIM-channel decode lengths (None if no PIM)
     channel_split: int  # PIM channel split factor
     decode_q_len: int = 1  # query tokens per decode sequence (1 + N under spec decode)
+    model_rows: object = None  # Full model row count, or None outside local SP views.
 
 
 @dataclass
@@ -776,7 +781,19 @@ def _lookup_dense(perf_db, name, tp, tokens):
             f"Missing dense profile for layer={name} on tp={tp_eff}. "
             f"Check that the architecture catalog and dense.csv agree."
         )
-    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(tokens), 1))))
+    query = max(int(tokens), 1)
+    keys, values = tbl['keys'], tbl['values']
+    if name in ('sp_input_padding', 'sp_output_padding', 'sp_padding_mask'):
+        # Padding costs depend on both T and the number of added rows. Do
+        # not interpolate between different T % TP branches or no-op calls.
+        pairs = [(k, v) for k, v in zip(keys, values)
+                 if k % tp == query % tp and (k % tp or name == 'sp_padding_mask')]
+        if pairs:
+            keys, values = zip(*pairs)
+        else:
+            logger.warning('No %s measurement with token remainder %d at TP=%d; '
+                           'interpolating across remainders', name, query % tp, tp)
+    return max(1, int(_lookup_1d(keys, values, query)))
 
 
 def _lookup_per_sequence(perf_db, name, tp, sequences):
@@ -1175,17 +1192,22 @@ def _catalog_has(perf_db, category, name):
 # Context builders
 # ======================================================================
 
-def _require_attention_parallelism(architecture, tp_size, pp_size, local_ep, ep_total):
-    """Refuse attention-wide SP before a trace can publish partial output.
+def _require_attention_parallelism(architecture, tp_size, pp_size, local_ep, ep_total, model_type=None):
+    """Select V4.1 attention SP; refuse other unimplemented layouts.
 
     vLLM 0.28/0.31 Qwen TP+DP MoE at PP1 keeps sequence shards across
     blocks. A wrapper-only MoE AllGather cannot represent that execution.
+    V4.1's returned flag is validated with its row and timing layout later.
     The simulator's supported expert transport is allgather_reducescatter.
     """
     if tp_size <= 1 or pp_size != 1 or ep_total <= max(local_ep, 1):
         return
     if any(entry.get("attention_sequence_parallel", False)
            for entry in architecture["catalog"].get("moe", {}).values()):
+        if model_type in ('deepseek_v41', 'deepseek_v41_text'):
+            if local_ep != tp_size or ep_total % tp_size:
+                raise ValueError('V4.1 attention SP requires full TP*DP expert parallelism')
+            return True
         raise NotImplementedError(
             "This TP>1 + DP>1 + EP deployment uses attention-wide sequence "
             "parallelism: attention AllGather/ReduceScatter, local norm/MoE "
@@ -1198,7 +1220,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, num_speculative_tokens=0,
-                     dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                     dp_rank=0, dp_token_counts=(), dp_valid_token_counts=(), duration_replay_only=False):
     if dp_rank < 0 or (gate is not None and (dp_rank + 1) * max(local_ep, 1) > ep_total):
         raise ValueError("DP member's local expert ranks exceed the EP group")
     model_type = config.get('model_type')
@@ -1211,9 +1233,19 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     perf_db = _load_perf_db(hardware, model, variant, tp_needed, model_type,
                             model_config=config)
     perf_db = dict(perf_db, key_saturation=perf_db["key_saturation_by_tp"][max(int(tp_size), 1)])
-    if gate is not None:
-        _require_attention_parallelism(perf_db["architecture"], tp_size, pp_size,
-                                      local_ep, ep_total)
+    native_weights = None
+    if model_type in ('deepseek_v41', 'deepseek_v41_text'):
+        records = perf_db.get('meta', {}).get('per_tp') or {}
+        tp_record = records.get(str(tp_size), records.get(tp_size, {})) or {}
+        memory_record = tp_record.get('native_memory')
+        if memory_record is not None:
+            native_weights = memory_record.get('operator_weight_bytes')
+            if (not isinstance(native_weights, list) or len(native_weights) != config['num_hidden_layers']
+                    or any(not isinstance(layer, dict) or any(type(value) is not int or value < 0
+                            for value in layer.values()) for layer in native_weights)):
+                raise ValueError('Native V4.1 operator weight inventory is incomplete')
+    attention_sp = bool(gate is not None and _require_attention_parallelism(
+        perf_db["architecture"], tp_size, pp_size, local_ep, ep_total, model_type))
     warn_if_runtime_exceeds_profiled(
         perf_db, runtime_max_num_batched_tokens, runtime_max_num_seqs)
 
@@ -1242,13 +1274,18 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         dp_min_total_len=dp_min_total_len,
         dp_token_counts=tuple(dp_token_counts),
+        dp_valid_token_counts=tuple(dp_valid_token_counts),
+        native_operator_weights=native_weights,
         num_speculative_tokens=num_speculative_tokens,
         component_sizes=_selected_component_sizes(perf_db, tp_size, config),
         duration_replay_only=duration_replay_only,
+        attention_sequence_parallel=attention_sp,
     )
     if ctx.component_sizes is not None:
         from .component_sizes import validate_local_trace
         validate_local_trace(ctx)
+    if attention_sp:
+        _validate_attention_sp(ctx)
     return ctx
 
 
@@ -1391,13 +1428,20 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
                                        parallel=ctx.tp_size, fp=ctx.fp)
     else:
         length = bctx.lm_head_len if category == "per_sequence" else bctx.total_len
+        size_options = {}
+        if ctx.config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text'):
+            size_options = dict(
+                sequence_parallel=bool(getattr(ctx, 'attention_sequence_parallel', False)),
+                model_rows=bctx.model_rows, layer_index=layer_num)
         inp, wt, out = calculate_sizes(ctx.model, layer_name, length,
                                        parallel=ctx.tp_size, fp=ctx.fp,
-                                       component_sizes=ctx.component_sizes)
+                                       component_sizes=ctx.component_sizes, **size_options)
 
     if layer_num is None and comm_type == 'NONE':
         comm_type, comm_size = _shared_tp_collective(ctx, bctx, layer_name)
 
+    if layer_num is not None and getattr(ctx, 'native_operator_weights', None) is not None:
+        wt = ctx.native_operator_weights[layer_num].get(layer_name, wt)
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
@@ -1525,6 +1569,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     from .moe_execution import emit_native_components
     if emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag):
         return
+    if getattr(ctx, 'attention_sequence_parallel', False):
+        raise ValueError('Attention-wide SP requires matching native MoE component profiles')
     ep_total = ctx.ep_total
 
     # AG/RS comm size and MoE compute are the **same** quantity: the gathered
@@ -1978,9 +2024,208 @@ def _is_contextual_profile(ctx):
     return getattr(ctx.component_sizes, 'schema', None) == CONTEXTUAL_PROFILE
 
 
+def _validate_attention_sp(ctx):
+    """Admit the V4.1 PP1, unfused, no-MTP attention-wide SP trace path.
+
+    Engram table sharing is deployment-specific, unlike the decoder schedule.
+    A per-TP acquisition record must explicitly identify the timing layout;
+    never reconstruct missing records or treat global DP as node-local EDP.
+    """
+    if (ctx.config.get('model_type') not in ('deepseek_v41', 'deepseek_v41_text')
+            or ctx.pp_size != 1 or ctx.tp_size < 2
+            or ctx.local_ep != ctx.tp_size or ctx.ep_total % ctx.tp_size):
+        raise NotImplementedError('Attention-wide SP requires V4.1 PP1 and full TP*DP EP')
+    if ctx.config['num_attention_heads'] % ctx.tp_size or ctx.config['o_groups'] % ctx.tp_size:
+        raise ValueError('V4.1 attention heads and output groups must divide TP')
+    counts = ctx.dp_token_counts
+    dp = ctx.ep_total // ctx.tp_size
+    if (dp < 2 or len(counts) != dp or any(type(n) is not int or n < 1 for n in counts)
+            or not 0 <= ctx.dp_rank < dp or sum(counts) != ctx.dp_sum_total_len
+            or min(counts) != ctx.dp_min_total_len):
+        raise ValueError('Attention-wide SP requires the complete padded DP token vector')
+    if ctx.num_speculative_tokens or ctx.pd_type is not None or ctx.enable_attn_offloading:
+        raise NotImplementedError('Attention-wide SP does not cover MTP, P/D or PIM execution')
+    if ctx.component_sizes is not None or ctx.fp != 2:
+        raise NotImplementedError('Attention-wide SP currently requires ordinary 16-bit compute boundaries')
+    effective = ctx.perf_db.get('meta', {}).get('engine_effective') or {}
+    kernel = effective.get('kernel_config') or {}
+    if not isinstance(kernel, dict):
+        raise ValueError('Attention SP requires a mapping for recorded kernel_config')
+    if kernel.get('moe_backend', effective.get('moe_backend', 'auto')) in (
+            'deep_gemm_mega_moe', 'flashinfer_moe_ep_mega_deep_gemm',
+            'flashinfer_moe_ep_mega_cutedsl'):
+        raise NotImplementedError('MegaMoE requires its own measured expert communication layout')
+    if (ctx.tp_dim is None or ctx.ep_dim is None or len(ctx.tp_dim) != len(ctx.ep_dim)
+            or not any(ctx.tp_dim) or not any(e and not t for e, t in zip(ctx.ep_dim, ctx.tp_dim))):
+        raise ValueError('Attention-wide SP requires explicit TP and EP topology dimensions')
+    record = ((ctx.perf_db.get('meta', {}).get('engram_execution') or {}).get('per_tp') or {}).get(str(ctx.tp_size))
+    if (not isinstance(record, dict)
+            or any(type(record.get(key)) is not int for key in ('tp', 'dp', 'wkv_tp_size', 'effective_edp_size'))
+            or record.get('tp') != ctx.tp_size
+            or record.get('dp') != dp or record.get('sequence_parallel') is not True
+            or record.get('wkv_tp_size') != 1):
+        raise ValueError('Attention-wide SP needs matching engram_execution.per_tp metadata '
+                         'with TP/DP, sequence_parallel=true and replicated wkv_tp_size=1')
+    if record.get('effective_edp_size') != 1:
+        raise NotImplementedError('Engram SP currently requires observed effective_edp_size=1; '
+                                  'node-local EDP subgroup collectives are not implemented')
+    # Unrecorded flags take vLLM's defaults: VLLM_MOE_SKIP_PADDING,
+    # VLLM_ENABLE_GEMM_RS and MTP are all off unless requested.
+    if record.get('moe_skip_padding', False):
+        if type(record.get('padding_mask_is_none')) is not bool:
+            raise ValueError('SP execution metadata must record padding_mask_is_none')
+        valid = ctx.dp_valid_token_counts
+        if (len(valid) != dp or any(type(n) is not int or not 0 <= n <= total
+                                   for n, total in zip(valid, counts))):
+            raise ValueError('Padding-aware SP needs the unpadded valid-token vector for every DP member')
+    if record.get('gemm_rs') or record.get('mtp') or record.get('aux_hidden_state_layers'):
+        raise NotImplementedError('Fused GEMM-RS or MTP needs a separate measured SP execution layout')
+    engram_tp_geometry(ctx.config, ctx.tp_size, sequence_parallel=True)
+
+
+def _sp_local_batch(ctx, bctx):
+    """A lookup/sizing view; never change attention axes or DP token counts."""
+    model_rows = bctx.model_rows if bctx.model_rows is not None else bctx.total_len
+    local, _ = sequence_parallel_rows(model_rows, ctx.tp_size)
+    return replace(bctx, total_len=local, model_rows=model_rows)
+
+
+def _require_dense_boundary(ctx, name):
+    if not _layer_available(ctx.perf_db, ctx.tp_size, name):
+        raise ValueError(f'Missing {name} profile; refusing a partial parallel trace')
+    tp = _effective_tp(ctx.perf_db, 'dense', name, ctx.tp_size)
+    values = _tp_tables(ctx.perf_db, tp)['dense'][name]['values']
+    if not values or any(not math.isfinite(v) or v <= 0 for v in values):
+        raise ValueError(f'Parallel boundary {name} requires positive measured CUDA time')
+
+
+def _validate_local_engram_dp(ctx):
+    """Admit observed TP1 CPU-shared Engram without an EDP collective."""
+    counts = ctx.dp_token_counts
+    dp = len(counts)
+    if (ctx.tp_size != 1 or ctx.pp_size != 1 or dp < 2
+            or ctx.local_ep != 1 or ctx.ep_total != dp
+            or getattr(ctx, 'gate', None) is None
+            or getattr(ctx, 'attention_sequence_parallel', False)):
+        raise NotImplementedError('Non-SP multi-DP Engram requires observed TP1/PP1 full EP')
+    if (any(type(n) is not int or n < 1 for n in counts)
+            or sum(counts) != ctx.dp_sum_total_len):
+        raise ValueError('Engram requires the complete positive DP token vector')
+    record = ((ctx.perf_db.get('meta', {}).get('engram_execution') or {}).get('per_tp') or {}).get('1')
+    # Only these two fields change the emitted communication.
+    if (not isinstance(record, dict) or record.get('wkv_tp_size') != 1
+            or record.get('effective_edp_size') != 1):
+        raise ValueError('TP1 multi-DP Engram needs engram_execution.per_tp["1"] '
+                         'with wkv_tp_size=1 and effective_edp_size=1')
+
+
+def _engram_collectives_after(ctx, bctx, layer_num, layers):
+    """Attach EDP1 Engram gathers to real compute rows.
+
+    The converter chains each collective after its row's compute and the
+    next compute after that collective. Zero-compute communication rows do
+    not carry this dependency contract. Hash EDP gathering and conditional
+    EDP row selection is outside this path. SP keeps the first gather only;
+    its separate row-selection kernel is inserted before replicated wkv.
+    """
+    if not {'engram_wkv', 'engram_gate'}.intersection(layers):
+        return {}
+    if (layers.count('engram_wkv') != 1 or layers.count('engram_gate') != 1
+            or layers.count('mhc_engram_post') != 1):
+        raise ValueError('Engram requires one post, wkv and gate boundary per layer')
+    start = layers.index('mhc_engram_post')
+    if list(layers[start:start + 3]) != ['mhc_engram_post', 'engram_wkv', 'engram_gate']:
+        raise ValueError('Engram post/wkv/gate boundaries must be consecutive and ordered')
+    if layer_num is None or layer_num not in (ctx.config.get('engram_layer_ids') or []):
+        raise ValueError('Engram compute boundaries do not match the configured layer')
+    sp = bool(getattr(ctx, 'attention_sequence_parallel', False))
+    if sp:
+        _validate_attention_sp(ctx)
+    elif (ctx.pp_size != 1 or ctx.dp_sum_total_len > 0 or len(ctx.dp_token_counts) > 1
+            or ctx.ep_total > max(ctx.local_ep, 1)):
+        _validate_local_engram_dp(ctx)
+    effective = ctx.perf_db.get('meta', {}).get('engine_effective') or {}
+    kernel = effective.get('kernel_config') or {}
+    if not isinstance(kernel, dict):
+        raise ValueError('Engram requires a mapping for recorded kernel_config')
+    backend = kernel.get('moe_backend', effective.get('moe_backend', 'auto'))
+    # vLLM 0.31 kernel.py MEGA_MOE_BACKENDS, used by V4.1's SP predicate.
+    if (not sp and ctx.tp_size > 1 and ctx.gate is not None and backend in
+            ('deep_gemm_mega_moe', 'flashinfer_moe_ep_mega_deep_gemm',
+             'flashinfer_moe_ep_mega_cutedsl')):
+        raise NotImplementedError('Engram with MegaMoE uses unsupported sequence parallelism')
+    if ctx.component_sizes is not None:
+        raise NotImplementedError('Engram TP gathers require the ordinary compute-boundary layout')
+    if ctx.fp != 2:
+        raise NotImplementedError('Engram TP gathers currently require the native 16-bit activation layout')
+    geometry = engram_tp_geometry(ctx.config, ctx.tp_size, sequence_parallel=sp)
+    timing_layout = ((ctx.perf_db.get('meta', {}).get('engram_execution') or {}).get('per_tp') or {}).get(str(ctx.tp_size))
+    if not sp and timing_layout and timing_layout.get('sequence_parallel'):
+        raise ValueError('Replicated SP Engram timings cannot be replayed as non-SP column shards')
+    for name in ('mhc_engram_post', 'engram_wkv', 'engram_gate'):
+        _require_dense_boundary(ctx, name)
+    if sp:
+        _require_dense_boundary(ctx, 'engram_select_rows')
+    if ctx.tp_size == 1:
+        return {}
+    # The lookup writes BF16, and wkv consumes/returns that 16-bit layout.
+    # AllGather data_size is the local padded chunk, not the full result.
+    rows = bctx.total_len
+    heads_bytes = rows * geometry['local_heads'] * ctx.config['engram_head_dim'] * 2
+    output_bytes = rows * geometry['local_output_width'] * 2
+    kind = _with_dim('ALLGATHER', ctx.tp_dim)
+    if sp:
+        return {'mhc_engram_post': (kind, heads_bytes)}
+    return {'mhc_engram_post': (kind, heads_bytes), 'engram_wkv': (kind, output_bytes)}
+
+
 def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag, source_role=None):
     """Emit an already resolved sequence without applying substitutions twice."""
+    engram_comms = _engram_collectives_after(ctx, bctx, layer_num, layers)
+    sp = bool(getattr(ctx, 'attention_sequence_parallel', False))
+    local_batch = _sp_local_batch(ctx, bctx) if sp else bctx
+    sp_comms = {}
+    if sp:
+        _validate_attention_sp(ctx)
+        if bctx.total_len != ctx.dp_token_counts[ctx.dp_rank]:
+            raise ValueError('SP batch rows differ from the current DP wave')
+        for name in layers:
+            if not _layer_available(ctx.perf_db, ctx.tp_size, name):
+                raise ValueError(f'Missing {name} profile; refusing a partial SP trace')
+            if _layer_category(ctx.perf_db, name) == 'dense':
+                _require_dense_boundary(ctx, name)
+        if source_role == 'pre_attn':
+            index = layers.index('input_projections')
+            if index < 1 or layers[index - 1] not in ('mhc_pre', 'mhc_shifted_post_pre'):
+                raise ValueError('Attention SP input must follow its local mHC pre boundary')
+            boundary = layers[index - 1]
+            _require_dense_boundary(ctx, boundary)
+            sp_comms[boundary] = (_with_dim('ALLGATHER', ctx.tp_dim),
+                                  local_batch.total_len * ctx.config['hidden_size'] * ctx.fp)
+        if 'output_projections' in layers:
+            _require_dense_boundary(ctx, 'output_projections')
+            _, padded = sequence_parallel_rows(bctx.total_len, ctx.tp_size)
+            if padded != bctx.total_len:
+                _require_dense_boundary(ctx, 'sp_output_padding')
+    local_names = {'mhc_pre', 'mhc_engram_post', 'mhc_shifted_post_pre',
+                   'engram_wkv', 'engram_gate', 'engram_select_rows'}
     for layer_name in layers:
+        compute_batch = local_batch if sp and layer_name in local_names else bctx
+        if sp and layer_name == 'engram_wkv':
+            _emit_layer(ctx, local_batch, 'engram_select_rows', lines, power_acc,
+                        batch_tag, layer_num)
+        if sp and layer_name == 'output_projections':
+            _, padded = sequence_parallel_rows(bctx.total_len, ctx.tp_size)
+            comm = _with_dim('REDUCESCATTER', ctx.tp_dim)
+            size = padded * ctx.config['hidden_size'] * ctx.fp
+            if padded != bctx.total_len:
+                _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
+                _emit_layer(ctx, bctx, 'sp_output_padding', lines, power_acc,
+                            batch_tag, layer_num, comm_type=comm, comm_size=size)
+            else:
+                _emit_layer(ctx, bctx, layer_name, lines, power_acc,
+                            batch_tag, layer_num, comm_type=comm, comm_size=size)
+            continue
         if layer_name == 'attn_res' and _is_contextual_profile(ctx):
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         source_role=source_role)
@@ -2003,6 +2248,11 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
                     ctx.perf_db["model"], ctx.perf_db["variant"],
                 )
             continue
+        if layer_name in engram_comms or layer_name in sp_comms:
+            comm_type, comm_size = (engram_comms if layer_name in engram_comms else sp_comms)[layer_name]
+            _emit_layer(ctx, compute_batch, layer_name, lines, power_acc, batch_tag, layer_num,
+                        comm_type=comm_type, comm_size=comm_size)
+            continue
         reduction = ctx.perf_db["architecture"]["catalog"].get("dense", {}).get(layer_name, {}).get("tp_output_reduction")
         if layer_name in _TP_ALLREDUCE_AFTER or reduction == "all_reduce":
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
@@ -2024,7 +2274,7 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_size=_pd_kv_send_bytes(ctx, bctx))
         else:
-            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
+            _emit_layer(ctx, compute_batch, layer_name, lines, power_acc, batch_tag, layer_num)
 
 
 def _block_copy_key(ctx, block_mode_on, *layer_nums):
@@ -2292,14 +2542,30 @@ def _emit_final_layers(ctx, bctx, rows, batch_tag='NONE'):
     """
     head_layers = _component_site_sequence(ctx.perf_db, ctx.tp_size,
                                            ("shared", "head"), role="shared")
+    sp = bool(getattr(ctx, 'attention_sequence_parallel', False))
+    local_batch = _sp_local_batch(ctx, bctx) if sp else bctx
+    if sp:
+        _validate_attention_sp(ctx)
+        if list(head_layers[:3]) != ['stack_post', 'hc_collapse', 'final_layernorm']:
+            raise ValueError('V4.1 SP head must collapse and normalize before gathering')
+        for name in head_layers[:3]:
+            _require_dense_boundary(ctx, name)
     idle = bctx.lm_head_len == 0
     if idle:
         # The dummy forward still runs its final norm, but no logits/sampling.
         head_layers = [name for name in head_layers
                        if _layer_category(ctx.perf_db, name) != "per_sequence"]
+    head_events = []
     for i, layer_name in enumerate(head_layers):
         output_loc = f'REMOTE:{ctx.node_id}' if i == len(head_layers) - 1 else 'LOCAL'
-        _emit_layer(ctx, bctx, layer_name, rows, None, batch_tag, output_loc=output_loc)
+        compute_batch = local_batch if sp and layer_name in ('stack_post', 'hc_collapse', 'final_layernorm') else bctx
+        comm, size = 'NONE', 0
+        if sp and layer_name == 'final_layernorm':
+            comm = _with_dim('ALLGATHER', ctx.tp_dim)
+            size = local_batch.total_len * ctx.config['hidden_size'] * ctx.fp
+        _emit_layer(ctx, compute_batch, layer_name, rows, None, batch_tag,
+                    output_loc=output_loc, comm_type=comm, comm_size=size)
+        head_events.append((layer_name, compute_batch, comm, size))
     if idle and rows:
         # Retain a normal final trace row for the converter, with no token IDs
         # sent back to the host. Its compute and TP dependencies are unchanged.
@@ -2308,15 +2574,16 @@ def _emit_final_layers(ctx, bctx, rows, batch_tag='NONE'):
         rows[-1] = tuple(last)
 
     if ctx.power_model is not None:
-        for layer_name in head_layers:
-            lat = _layer_latency_for_power(ctx, bctx, layer_name)
+        for layer_name, compute_batch, explicit_comm, explicit_size in head_events:
+            lat = _layer_latency_for_power(ctx, compute_batch, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
-            comm, size = _shared_tp_collective(ctx, bctx, layer_name)
+            comm, size = ((explicit_comm, explicit_size) if explicit_size
+                          else _shared_tp_collective(ctx, compute_batch, layer_name))
             if size:
                 ctx.power_model.add_link_energy_consumption(ctx.node_id, total_ring_data(
                     size, ctx.tp_size, collective=comm.split(':')[0].lower()))
             if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
-                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
+                _, wt, _ = calculate_sizes(ctx.model, layer_name, compute_batch.total_len, parallel=ctx.tp_size, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
@@ -2344,6 +2611,16 @@ def _emit_prologue(ctx, bctx, rows, batch_tag='NONE'):
     """
     prologue_layers = _component_site_sequence(ctx.perf_db, ctx.tp_size,
                                                ("shared", "prologue"), role="shared")
+    if getattr(ctx, 'attention_sequence_parallel', False):
+        _validate_attention_sp(ctx)
+        _, padded = sequence_parallel_rows(bctx.total_len, ctx.tp_size)
+        record = ctx.perf_db['meta']['engram_execution']['per_tp'][str(ctx.tp_size)]
+        if record.get('moe_skip_padding', False) and (padded != bctx.total_len or record['padding_mask_is_none']):
+            _require_dense_boundary(ctx, 'sp_padding_mask')
+            prologue_layers = [*prologue_layers, 'sp_padding_mask']
+        if padded != bctx.total_len:
+            _require_dense_boundary(ctx, 'sp_input_padding')
+            prologue_layers = [*prologue_layers, 'sp_input_padding']
     if not prologue_layers:
         return 0
     before = len(rows)
@@ -2372,7 +2649,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), dp_valid_token_counts=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2382,6 +2659,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
+                           dp_valid_token_counts=dp_valid_token_counts,
                            duration_replay_only=duration_replay_only)
     bctx = _build_batch_ctx(batch, ctx)
 
@@ -2472,7 +2750,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), dp_valid_token_counts=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2482,9 +2760,12 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
+                           dp_valid_token_counts=dp_valid_token_counts,
                            duration_replay_only=duration_replay_only)
     if ctx.component_sizes is not None:
         raise NotImplementedError('Native DSA interleaved trace execution is not yet admitted')
+    if ctx.attention_sequence_parallel:
+        raise NotImplementedError('Attention-wide SP interleaving requires per-sub-batch DP token vectors')
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -2627,7 +2908,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, enable_block_copy=True, inputs_root=None,
-                   num_speculative_tokens=0, gate_stats_path=None, dp_rank=0, dp_token_counts=(),
+                   num_speculative_tokens=0, gate_stats_path=None, dp_rank=0, dp_token_counts=(), dp_valid_token_counts=(),
                    *, duration_replay_only=False):
 
     if type(duration_replay_only) is not bool:
@@ -2699,6 +2980,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         dp_min_total_len=dp_min_total_len,
                         num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                         dp_token_counts=tuple(dp_token_counts),
+                        dp_valid_token_counts=tuple(dp_valid_token_counts),
                         duration_replay_only=duration_replay_only)
     if not enable_sub_batch_interleaving:
         rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)

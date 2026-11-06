@@ -1,0 +1,521 @@
+# DeepSeek-V4.1 Flash: candidate operator bindings for upstream vLLM v0.31.0.
+#
+# Source ref: db9527a46873454610df6dbedf79a36d6bf1a7f6.
+# Target checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017 (FP8 dense layers,
+# MXFP4 routed experts) in a two-node TP4/DP2/EP8 sequence-parallel deployment.
+# Earlier TP1 FP8-conversion audits do not cover this checkpoint or layout;
+# CUDA coverage, backends and dispatch layout must be re-observed on hardware.
+# Bindings do not certify published latency tables or end-to-end accuracy.
+# Residual runner activities remain explicit.
+# Source branches and checkpoint mapping: results/model-onboarding/deepseek-v41/yaml-source-mapping.md.
+# Runtime representation choices must come from acquisition observations,
+# not a device-name rule in this catalog. Architecture/metadata boundaries:
+# results/model-onboarding/deepseek-v41/catalog-runtime-separation.md.
+#
+# This inventory proposes capture boundaries; bindings do not select a GPU
+# or communication backend. Communications are audited under source conditions.
+# The source ref is review evidence, not a captured runtime contract.
+# COMM markers are source annotations only, not executable communication entries;
+# full ledger: results/model-onboarding/deepseek-v41/vllm-v031-communication-map.md.
+#
+# Plain string lists only; no custom sequence syntax or parser changes.
+# The attn keys below label source branches, not native layer_types. The
+# original checkpoint has no such layer_types; stack.py derives these labels
+# from its native schedules. No full_attention fallback: replaying one branch
+# uniformly would silently omit or duplicate conditional work.
+# The lists describe candidate composition, not measured stream dependencies.
+
+model_types:
+  - deepseek_v41
+
+blocks:
+  attn:
+    # First decoder: no pending post from a preceding layer.
+    swa_initial:
+      pre_attn:
+        - mhc_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+
+    # Engram injection separates the preceding post from this layer's pre.
+    swa_engram:
+      pre_attn:
+        - mhc_engram_post
+        # COMM C04: EDP1 TP heads AllGather is emitted after the post.
+        # COMM C03: EDP rows gather is unsupported and rejected by serving.
+        # SP inserts engram_select_rows before replicated engram_wkv.
+        - engram_wkv
+        # COMM C05: EDP1/non-SP TP wkv-output AllGather is emitted HERE.
+        - engram_gate
+        - mhc_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+
+    # Owns both compressed KV production and an indexer.
+    compressed_source:
+      pre_attn:
+        - mhc_shifted_post_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - compress_state_norm
+        - indexer_prepare
+        - compressed_cache_write
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+
+    compressed_source_engram:
+      pre_attn:
+        - mhc_engram_post
+        # COMM C04: EDP1 TP heads AllGather is emitted after the post.
+        # COMM C03: EDP rows gather is unsupported and rejected by serving.
+        # SP inserts engram_select_rows before replicated engram_wkv.
+        - engram_wkv
+        # COMM C05: EDP1/non-SP TP wkv-output AllGather is emitted HERE.
+        - engram_gate
+        - mhc_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - compress_state_norm
+        - indexer_prepare
+        - compressed_cache_write
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+
+    # Reuses compressed KV and selection state produced by earlier sources.
+    compressed_reuse:
+      pre_attn:
+        - mhc_shifted_post_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+
+    # Reuses compressed KV but prepares a new index selection.
+    compressed_index_source:
+      pre_attn:
+        - mhc_shifted_post_pre
+        # COMM C06: SP TP AllGather after local mHC, before attention input projections.
+        - input_projections
+        - qkv_norm
+        - q_b_proj
+        - swa_rope_cache
+        - indexer_prepare
+        - indexer_attention
+      post_attn:
+        - output_projections
+        # COMM C07: non-SP ordinary wo_b reduces in projection (TP AllReduce);
+        # SP instead ReduceScatters here (or inside GEMM-RS), before FFN mHC.
+        - mhc_shifted_post_pre
+  mlp:
+    # COMM C08/C09/C10 are conditional boundaries INSIDE this MoE parent:
+    # dispatch AllGather(v) -> experts -> combine ReduceScatter(v), with a
+    # final TP AllReduce only when the non-SP output still needs reduction.
+    moe: [moe]
+
+shared:
+  # Hash once; lookup aggregates this model call's Engram table lookups.
+  prologue:
+    # COMM C01: TP AllReduce inside embedding.
+    - embedding
+    - engram_hash
+    # COMM C02: optional node-local Engram-DP hash AllGather HERE, before lookup.
+    - engram_lookup
+  head:
+    # COMM C14: a runtime-selected deferred-mHC implementation can reduce
+    # before stack_post, replacing its ordinary output AR rather than adding AR.
+    - stack_post
+    # COMM C11: with an MTP hidden buffer, SP gathers full HC hidden_states
+    # and pre_mix BEFORE collapse, instead of the no-MTP gather below.
+    - hc_collapse
+    - final_layernorm
+    # COMM C11: SP final-hidden TP AllGather (no MTP).
+    - lm_head
+    # COMM C12: platform-selected TP Gather/AllGather inside LogitsProcessor;
+    # skip_gather bypasses.
+    - sampler
+
+catalog:
+  dense:
+    # S1 model.py: input embedding, conditional on the runner input path.
+    # Native config geometry and target/drafter ancestry must be checked live.
+    # COMM C01: TP AllReduce is inside embedding. Source: vllm/model_executor/layers/vocab_parallel_embedding.py:562-563.
+    embedding:
+      vllm: VocabParallelEmbedding
+      within: DeepseekV4Model
+      normalization: invocations
+
+    # S2 engram.py: hash/cache update before the decoder loop.
+    # A profile forward without bound KV metadata can skip this entire region.
+    # COMM C02: optional EDP hash AllGather follows hash production, before
+    # prepare_embeddings. model.py:884-895; nvidia/engram.py:112-131.
+    engram_hash:
+      vllm: NgramHashState
+      within: DeepseekV4Model
+      normalization: invocations
+
+    # S2 engram.py: GPU table lookup from Engram.prepare_embeddings.
+    # This is a SOURCE kernel name, not an observed profiler-node identity.
+    # prepare_embeddings runs outside Engram.forward; declaring it as a method
+    # owned by Engram would lack an active owner. Do not invent that scope.
+    # Copies, alternate/offloaded lookups and surrounding masks remain audited
+    # gaps until a live profile determines their exact ownership.
+    # Parent normalization aggregates table calls under the active model;
+    # shared.prologue emits this aggregate once, not once per Engram table.
+    # COMM C02 precedes this aggregate. Lookup itself stages local rows;
+    # C03-C05 occur later when each Engram consumes its table, not here.
+    # nvidia/model.py:884-895; common/engram.py:968-972.
+    engram_lookup:
+      vllm: _engram_lookup_kernel
+      within: DeepseekV4Model
+      not_within: DeepseekV4DecoderLayer
+      normalization: parent
+
+    # S2 common/engram.py:1008; linear.py:603-618. Bind only the projection
+    # implementation: ColumnParallelLinear.forward also owns C05 AllGather.
+    # Serving emits C04 after mhc_engram_post and C05 after this GEMM on
+    # the PP1/DP1/non-SP path. SP uses replicated wkv and omits C05.
+    # Do not additionally bind Engram or wkv.forward: their subtrees overlap.
+    # SP selection is separate below. EDP _ready_rows selection/subgroups
+    # remain unsupported. All new boundaries still require live coverage.
+    engram_wkv:
+      callable:
+        name: EngramWkvProjection
+        kind: method
+        owner: Engram
+        path: wkv.quant_method.apply
+        within: DeepseekV4DecoderLayer
+      normalization: invocations
+
+    # S2 common/engram.py:1031: fused gating and residual update after C05.
+    # This is a source kernel selector, not an observed profiler-node identity.
+    # Keep the fused kernel whole; it contains normalization and gate math.
+    engram_gate:
+      vllm: _fused_engram_post_wkv_kernel
+      within: Engram
+      normalization: invocations
+
+    # SP/EDP1 only: scatter rank-major gathered heads into local token rows.
+    # Serving inserts this boundary before engram_wkv in SP mode. A measured
+    # replicated-wkv SP bundle is required; ordinary TP1 capture skips it.
+    engram_select_rows:
+      vllm: _engram_select_rows_kernel
+      within: Engram
+      normalization: invocations
+
+    # Conditional SP boundaries, inserted by serving only when T % TP != 0.
+    # Bind the imported sp_shard alias: it pads both hidden_states/input_ids
+    # before the layer loop. Parent normalization sums both invocations.
+    sp_input_padding:
+      callable:
+        name: SpInputPadding
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: sp_shard
+        within: DeepseekV4Model
+      normalization: parent
+
+    # Optional bool-mask initialization/padding precedes both sp_shard calls.
+    # It is separate from data padding and is controlled by the observed
+    # padding_mask_is_none and moe_skip_padding execution facts.
+    sp_padding_mask:
+      callable:
+        name: SpPaddingMask
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: sp_padding_mask
+        within: DeepseekV4Model
+      normalization: invocations
+
+    # The unfused SP output pad is outside Attention.forward. Exclude Q/head
+    # padding inside attention; fused GEMM-RS needs a different timing layout.
+    sp_output_padding:
+      operator: aten::constant_pad_nd
+      within: DeepseekV4DecoderLayer
+      not_within: DeepseekV4Attention
+      normalization: invocations
+
+    # S1 model.py: direct initial/Engram-boundary mHC pre and fused norm.
+    # Broadcast, ordinary and Engram contexts must not be pooled into one row.
+    # The two RMSNorm objects supply weights; they are not extra norm costs.
+    mhc_pre:
+      callable:
+        name: MhcPre
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: mhc_pre_delayed_tilelang
+        within: DeepseekV4DecoderLayer
+      normalization: invocations
+
+    # S1 model.py: shifted post of the preceding sublayer plus the next pre.
+    # This occurs at different attention/FFN and original-layer roles.
+    # Record those contexts before any token-only timing publication.
+    mhc_shifted_post_pre:
+      callable:
+        name: MhcShiftedPostPre
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: mhc_shifted_post_pre
+        within: DeepseekV4DecoderLayer
+      normalization: invocations
+
+    # COMM C13: requested aux hidden states may add SP TP AllGather at the
+    # corresponding decoder/final boundary. Not an unconditional per-layer
+    # operation. nvidia/model.py:942-960.
+
+    # S1 model.py: separate previous-post before an Engram injection.
+    # The same imported function is also used at the model tail; callable
+    # ancestry chooses the decoder-specific declaration while inside a layer.
+    mhc_engram_post:
+      callable:
+        name: MhcEngramPost
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: mhc_post_tilelang
+        within: DeepseekV4DecoderLayer
+      normalization: invocations
+
+    # S3 attention.py: parallel q/KV A, compressor-score and index-weight GEMMs.
+    # One enclosing CUDA-union boundary preserves overlap. Do not additionally
+    # bind _fused_wqa_wkv_gemm, fused_wkv_wgate or weights_proj underneath it.
+    # Contexts must identify which optional branches exist in the source layer.
+    # COMM C06: SP TP AllGather follows local mHC and precedes attention input projections. Source: vllm/models/deepseek_v41/nvidia/model.py:579-583.
+    input_projections:
+      callable:
+        name: InputProjections
+        kind: method
+        owner: DeepseekV4Attention
+        path: _run_parallel_input_projections
+      normalization: invocations
+
+    # S3 attention.py: split and fused q/KV RMSNorm, optionally Q quantization.
+    # Do not bind q_norm/kv_norm independently; their weights feed this region.
+    qkv_norm:
+      callable:
+        name: QkvNorm
+        kind: method
+        owner: DeepseekV4Attention
+        path: _split_qkv_and_norm
+      normalization: invocations
+
+    # S3 attention.py: main Q up-projection. Same-class wo_a is a different
+    # operation, so an unqualified ColumnParallelLinear binding is incorrect.
+    q_b_proj:
+      callable:
+        name: QueryBProjection
+        kind: method
+        owner: DeepseekV4Attention
+        path: _wq_b_proj
+      normalization: invocations
+
+    # S3 attention.py: Q RoPE/padding plus SWA KV RoPE/quantization/insertion.
+    # Cache-format branches and metadata-present/skipped calls need a live
+    # audit. Do not additionally bind the child native operators.
+    swa_rope_cache:
+      callable:
+        name: SwaRopeCache
+        kind: method
+        owner: DeepseekV4Attention
+        path: _fused_qnorm_rope_kv_insert
+      normalization: invocations
+
+    # Runtime concrete attention methods implement this common output boundary.
+    # wo_a can execute through raw weight access, bypassing module.forward.
+    # Keep this token-scaling region together for local candidate review.
+    # No separate _wo_b_proj/RowParallelLinear row is bound underneath it.
+    # This inventory does not implement its conditional network or size rules.
+    # COMM C07: non-SP wo_b TP AllReduce is inside the projection; SP instead
+    # ReduceScatters after attention or in _wo_b_proj (GEMM-RS/fallback).
+    # model.py:318-328,579-586; attention.py:699-712; linear.py:1780-1781.
+    # The existing declaration below covers the ordinary non-SP AllReduce.
+    # It does not implement the SP ReduceScatter switch; the existing
+    # attention-wide SP guard must keep refusing that unsupported deployment.
+    output_projections:
+      callable:
+        name: OutputProjections
+        kind: method
+        owner: DeepseekV4Attention
+        path: _o_proj
+      normalization: invocations
+      tp_output_reduction: all_reduce
+
+    # S1 model.py: final pending mHC post after the decoder loop.
+    # This differs from HC stream collapse and from decoder Engram-boundary post.
+    stack_post:
+      callable:
+        name: StackPost
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: mhc_post_tilelang
+        within: DeepseekV4Model
+      normalization: invocations
+
+    # S1 model.py: final hc_mult streams -> hidden_size, before final norm.
+    # The v0.31 implementation has no additional learned hc_head projection.
+    hc_collapse:
+      callable:
+        name: HcCollapse
+        kind: function
+        module: vllm.models.deepseek_v41.nvidia.model
+        attribute: hc_collapse_triton
+        within: DeepseekV4Model
+      normalization: invocations
+
+    # S1 model.py: only the final model norm; decoder norms are fused above.
+    # COMM C11: no-MTP SP gathers hidden AFTER this norm. With an MTP buffer,
+    # two pre-collapse gathers replace it. nvidia/model.py:973-990.
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV4Model
+      not_within: DeepseekV4DecoderLayer
+      normalization: invocations
+
+  per_sequence:
+    # S1 model.py: compute_logits invokes the target LogitsProcessor.
+    # Validate sampled/head row count against the actual runner policy.
+    # COMM C12: platform-selected TP Gather/AllGather inside LogitsProcessor;
+    # skip_gather bypasses it. Alternative argmax/top-k paths communicate
+    # different tensors. logits_processor.py:122-134,184-199,207-307.
+    lm_head:
+      vllm: LogitsProcessor
+      within: DeepseekV41LLMForCausalLM
+      normalization: invocations
+
+    # S6 sampler.py: runner-side V1 sampler; not owned by the text model.
+    # Actual class/root visibility, sampling mode and invocation remain unproven.
+    sampler:
+      vllm: Sampler
+      normalization: invocations
+
+  attention:
+    # S7 compressor.py: state save, compression and RMSNorm share a fused
+    # kernel. Ratio, boundary positions and request layout condition execution.
+    # These stateful candidates are conservatively placed in the multi-axis
+    # group for review; category/coordinate sufficiency is NOT established.
+    # A contextual/native adapter may be necessary instead of ordinary CSVs.
+    compress_state_norm:
+      callable:
+        name: CompressStateNorm
+        kind: method
+        owner: DeepseekV4Attention
+        path: compressor.forward
+      normalization: invocations
+      key_saturates: false
+
+    # S7 compressor.py: compressed main-cache RoPE/quant/write.
+    # Attention is the active owner; compressor.forward has already returned.
+    # K-cache format and source/consumer roles need distinct runtime contexts.
+    compressed_cache_write:
+      callable:
+        name: CompressedCacheWrite
+        kind: method
+        owner: DeepseekV4Attention
+        path: compressor.insert_cache
+      normalization: invocations
+      key_saturates: false
+
+    # S3 attention.py: index K production and query preparation, or the
+    # context-dependent short-history fill path. Keep this parent whole;
+    # do not additionally bind _produce_k, forward_q or their child GEMMs.
+    # The live index source may reuse an earlier KV-source compressor.
+    indexer_prepare:
+      callable:
+        name: IndexerPrepare
+        kind: method
+        owner: DeepseekV4Attention
+        path: indexer.forward
+      normalization: invocations
+      key_saturates: false
+
+    # S3 attention.py: sparse index scoring/top-k followed by FlashMLA.
+    # Keep the shared multi-axis tail together and do not bind forward_mqa
+    # or SparseAttnIndexer independently underneath it. Indexer scans the
+    # full relevant history; never inherit V3.2's attention saturation cap.
+    # c0/c1/c2 and source/consumer roles still require separate contexts.
+    indexer_attention:
+      callable:
+        name: IndexerAttention
+        kind: method
+        owner: DeepseekV4Attention
+        path: _sparse_indexer_and_attn
+      normalization: invocations
+      key_saturates: false
+
+  moe:
+    # S1 model.py: native parent selector, including routing and shared experts.
+    # New acquisition must use the existing native component mechanism, not a
+    # new whole-block moe.csv. This selector does not admit its FP4 backend,
+    # routing ABI, wrappers, deferred finalization or any target TP/DP/EP.
+    # COMM C08: dispatch AG(v) hidden/top-k weights/ids or hidden/router logits (+scales).
+    # COMM C09: combine RS(v). COMM C10: non-SP may final TP AR; SP adds no restore AG.
+    # Caller: nvidia/model.py:613. Concrete prepare/finalize calls live in
+    # fused_moe/prepare_finalize/naive_dp_ep.py:149-207,254-279;
+    # group selection and tensor exchange: device_communicators/all2all.py:61-158.
+    moe:
+      vllm: DeepseekV4MoE
+      normalization: invocations
+      sequence_parallel: true
+      attention_sequence_parallel: true
+      # These flags select the V4.1 attention-wide SP row domain. Serving
+      # requires a matching observed SP/EDP1 layout and native MoE tables;
+      # these declarations alone do not certify a deployment or acquisition.
+
+# Not represented as invented independent RMSNorm/rotary/MLP entries:
+# - attn_norm/ffn_norm are consumed by mHC; q_norm/kv_norm by fused Q/KV norm.
+# - compressor.norm and indexer.k_norm supply weights to fused state/cache work.
+# - wo_a's raw-weight einsum is inside the output-projection region.
+# - routed/shared-expert children belong to native MoE component contracts.
+#
+# Remaining ownership inventory, to settle from LIVE activity:
+# - first-layer HC broadcast/contiguous copy; wrapper masks, casts and reshapes;
+# - Engram hash setup/cache/mask and lookup staging work outside the bound kernel;
+# - short-history/empty metadata paths, attention planning and runner preparation;
+# - request/position/cache metadata and any unscoped copies/memsets;
+# - concurrency between Q/SWA work and compression, and between indexer
+#   preparation and compressed-cache insertion. Their independent work costs
+#   are not a validated serial critical-path latency model.
+#
+# No tp_stable flags, precision aliases, native_profile, component_layouts,
+# MTP sequence or inherited V3.2/GLM runtime contracts are asserted here.
+# COMM C15: PP stage sends/receives belong to runner boundaries, not every
+# decoder layer. Non-last stages return IntermediateTensors (model.py:968-971).
+# C13 auxiliary, C14 deferred-mHC, MTP/drafter and runner control paths are
+# conditional extensions; see the source ledger for their scope and limits.

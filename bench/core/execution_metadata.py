@@ -12,7 +12,7 @@ class ExecutionObserver:
 
 def snapshot_worker(worker, declared_config=None):
     from profiler.core.execution_metadata import (
-        bind_model_config, expected_capture_grids, model_dimensions, precision_scope,
+        bind_native_model_config, expected_capture_grids, model_dimensions, precision_scope,
         validate_execution,
     )
     import torch
@@ -48,9 +48,7 @@ def snapshot_worker(worker, declared_config=None):
     model_config = model.hf_config.to_dict()
     dimensions = model_dimensions(model_config)
     if declared_config is not None:
-        from copy import deepcopy
-        resolved = type(model.hf_config).from_dict(deepcopy(declared_config)).to_dict()
-        dimensions = bind_model_config(model_config, declared_config, resolved)
+        dimensions = bind_native_model_config(model, declared_config)
     scope = dict(tp_size=parallel.tensor_parallel_size, pp_size=parallel.pipeline_parallel_size,
                  dp_size=parallel.data_parallel_size,
                  ep_size=(parallel.tensor_parallel_size * parallel.data_parallel_size

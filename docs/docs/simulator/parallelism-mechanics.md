@@ -69,6 +69,45 @@ wrapper-only MoE restore implemented by the simulator. Such deployments are
 refused before trace emission. Use TP1 for DP+EP or DP1 for ordinary TP work;
 those alternatives still require matching profile coverage and validation.
 
+DeepSeek-V4.1's candidate catalog also declares these two existing SP fields.
+They describe a conditional source path and retain this refusal; they do not
+implement its missing network nodes. In upstream vLLM v0.31.0, the decoder
+gathers TP sequence shards before attention and reduce-scatters the attention
+output before FFN mHC. It keeps the MoE output sharded until the next layer's
+attention input gather. A TP restore gather immediately after each MoE would
+have the wrong dependency position. The no-MTP target gathers its final hidden
+states after HC collapse and final normalization. See the
+[upstream decoder and final-hidden boundaries](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/models/deepseek_v41/nvidia/model.py#L579).
+
+The supported V4.1 target is the original `DeepSeek-V4.1-Flash-1017`
+checkpoint at TP4/DP2/EP8, one TP4 group per node. Its MXFP4 routed experts
+use the `native-distributed-mxfp4-expert-region` component schema with full
+EP (`ep == tp * dp`). A recorded `dispatch_layout` lists each row tensor
+before the AllGather boundary with its dtype and row shape; the dispatch
+payload is the sum of those tensors. Weight-only expert backends dispatch
+BF16 hidden states plus top-k weights and IDs. The native page-pool record
+must match the simulated deployment scope at PP1. Engram SP still requires an observed
+`effective_edp_size` of 1, i.e. a per-DP-rank (unshared) Engram table.
+At the pinned vLLM commit this is the expected source outcome for one TP4
+group per node: no node holds two DP replicas, so no Engram DP group is
+formed and shared host tables fall back to per-rank tables. Under SP the
+Engram `wkv` projection is replicated (`wkv_tp_size` 1), and the shared expert
+runs replicated on each rank's local rows rather than as a TP shard. On SM90
+the automatic MXFP4 expert backend is Marlin with BF16 activations, which is
+why the dispatch hidden dtype is BF16; a later vLLM pin with MXFP8 Hopper
+activations would change the dispatch dtypes and require new contracts.
+The selected backend, dispatch dtypes and Engram layout must still be
+observed on the target hardware before acquisition.
+
+Engram adds separate internal exchanges: optional node-local DP hash/row
+gathers, a TP embedding-head gather, and a second TP gather of `wkv` output
+on the non-SP path. These cannot all be attached after a whole-Engram compute
+row, since its projection and gating consume their results. The current
+catalog's communication annotations document these source boundaries; they
+do not emit those exchanges. See
+[NVIDIA Engram staging](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/models/deepseek_v41/nvidia/engram.py#L408)
+and [Engram gather/projection order](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/models/deepseek_v41/common/engram.py#L925).
+
 ### Once-per-forward vocab-parallel endpoints
 
 Two additional collectives run outside those decoder blocks in the ordinary

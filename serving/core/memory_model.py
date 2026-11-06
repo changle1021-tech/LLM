@@ -7,6 +7,8 @@ from .utils import (
 from profiler.core.stack import LayerSpec
 from .block_pool import Device, BlockPool, PrefixCacheStats
 from .kv_cache_manager import TieredKVCacheManager, request_block_hashes
+from .communication import engram_tp_geometry, sequence_parallel_rows
+from .deepseek_v41_geometry import BOUNDARIES as V41_BOUNDARIES, logical_sizes as v41_logical_sizes
 from .logger import get_logger
 
 GB_TO_BYTE = 1024 * 1024 * 1024
@@ -175,7 +177,7 @@ class MemoryModel():
     an allocation that cannot be satisfied says so in the call that asks.
     """
 
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0, num_speculative_tokens=0):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0, num_speculative_tokens=0, native_page_pool=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -193,6 +195,13 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
         self.npu_memory_utilization = npu_memory_utilization
         self.num_speculative_tokens = int(num_speculative_tokens or 0)
+        self.native_page_pool = native_page_pool
+        if native_page_pool is not None and (
+                pp_size != 1 or block_size != native_page_pool.block_size
+                or kv_cache_dtype != native_page_pool.kv_cache_dtype
+                or enable_prefix_sharing or prefix_pool is not None or prefix_storage is not None
+                or cxl_mem or self.num_speculative_tokens):
+            raise ValueError('Native page pool does not match the local-only serving layout')
 
         self.config = get_config(model)
         self.kv_fp = kv_element_bytes(self.config, self.fp, kv_cache_dtype)  # KV cache bytes per element
@@ -221,7 +230,8 @@ class MemoryModel():
         self._cpu_reserved = 0
 
         self._bytes_per_token = self.get_kv(1)              # per rank
-        self._npu_bytes_per_block = self._bytes_per_token * block_size
+        self._npu_bytes_per_block = (native_page_pool.logical_block_bytes if native_page_pool
+                                     else self._bytes_per_token * block_size)
         self._cluster_bytes_per_token = self._bytes_per_token * self.num_npus
 
         # vLLM: requested = total_gpu_memory * gpu_memory_utilization, then
@@ -241,7 +251,14 @@ class MemoryModel():
                 f"than one {block_size}-token block "
                 f"({self._npu_bytes_per_block / MB_TO_BYTE:.2f}MB)"
             )
-        npu_blocks = kv_bytes // self._npu_bytes_per_block
+        if native_page_pool is None:
+            npu_blocks = kv_bytes // self._npu_bytes_per_block
+        else:
+            if native_page_pool.arena_bytes > kv_bytes:
+                raise ValueError('Observed native KV arena does not fit the instance memory budget')
+            npu_blocks = native_page_pool.logical_blocks
+            self.logger.info('NPU: native cache arena %d pages; conservative full-history pool %d blocks',
+                             native_page_pool.native_pages, npu_blocks)
 
         self.npu_pool = BlockPool(
             Device.NPU, int(npu_blocks), block_size, self._npu_bytes_per_block,
@@ -396,6 +413,8 @@ class MemoryModel():
         ranks are lighter — but using the heaviest-rank value here keeps
         the `weight > npu_mem` check safe.
         """
+        if getattr(self, 'native_page_pool', None) is not None:
+            return self.native_page_pool.resident_gpu_bytes
         pp = max(self.pp_size, 1)
         arch = get_architecture(self.model)
         shared = arch.get("shared") or {}
@@ -475,6 +494,8 @@ class MemoryModel():
         not (``num_kv_heads = 1``), so its bytes are the same on every rank and
         must not be divided.
         """
+        if getattr(self, 'native_page_pool', None) is not None:
+            return self.native_page_pool.kv_bytes(seq)
         if self._kv_bytes_per_token_per_rank is None:
             config, kv_fp = self.config, self.kv_fp
             stack = get_layer_stack(self.model) or [None] * self.n_layer
@@ -955,7 +976,8 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
-                    kv_lens=None, *, component_sizes=None):
+                    kv_lens=None, *, component_sizes=None, sequence_parallel=False,
+                    model_rows=None, layer_index=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
@@ -971,6 +993,11 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             raise ValueError("Logical component boundaries do not accept inferred cache traffic")
         return component_sizes.sizes(layer_name, length, parallel=parallel, pim=pim)
     config = get_config(model)
+    if (config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text')
+            and layer_name in V41_BOUNDARIES):
+        if pim or kv_len is not None or kv_lens is not None:
+            raise ValueError('V4.1 logical boundaries do not infer native cache traffic')
+        return v41_logical_sizes(config, layer_name, length, parallel, fp, layer_index)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     head_dim = config.get('head_dim', n_embd // n_head)
@@ -1081,8 +1108,81 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # - LayerNorm weights: replicated (NOT sharded).
     # - MoE experts: parallel = EP degree, each rank holds num_local_experts // p experts.
 
+    # ----------------- V4.1 Engram compute boundaries -----------------
+    if layer_name in ('mhc_engram_post', 'engram_wkv', 'engram_gate', 'engram_select_rows'):
+        geometry = engram_tp_geometry(config, parallel, sequence_parallel=sequence_parallel)
+        if type(length) is not int or length < 0:
+            raise ValueError('Engram token rows must be a nonnegative integer')
+        hc = config['hc_mult']
+        residual_width = hc * n_embd
+        if layer_name == 'mhc_engram_post':
+            # BF16 x/residual plus FP32 post and residual mixing coefficients.
+            input_size = length * ((n_embd + residual_width) * fp + (hc + hc * hc) * 4)
+            weight_size = 0
+            output_size = length * residual_width * fp
+        elif layer_name == 'engram_wkv':
+            input_size = length * geometry['embed_width'] * fp
+            # Match ordinary dense logical sizing. Packed quantization/scales
+            # require their own measured layout; this is not capacity admission.
+            weight_size = geometry['embed_width'] * geometry['local_output_width'] * fp
+            output_size = length * geometry['local_output_width'] * fp
+        elif layer_name == 'engram_gate':
+            input_size = length * (residual_width + geometry['output_width']) * fp
+            weight_size = 2 * residual_width * fp  # q_weight and k_weight
+            output_size = length * residual_width * fp
+        else:
+            if not sequence_parallel or model_rows is None:
+                raise ValueError('Engram row selection needs the SP source token count')
+            local, _ = sequence_parallel_rows(model_rows, parallel)
+            if length != local:
+                raise ValueError('Engram selection output does not match the local SP rows')
+            input_size = parallel * model_rows * geometry['local_heads'] * config['engram_head_dim'] * fp
+            weight_size = 0
+            output_size = local * geometry['embed_width'] * fp
+
+    elif layer_name in ('mhc_pre', 'mhc_shifted_post_pre', 'stack_post', 'hc_collapse',
+                         'sp_input_padding', 'sp_output_padding', 'sp_padding_mask', 'output_projections'):
+        if config.get('model_type') not in ('deepseek_v41', 'deepseek_v41_text'):
+            raise ValueError(f'{layer_name} requires the V4.1 tensor layout')
+        hc = config['hc_mult']
+        residual_width = hc * n_embd
+        mixes = hc * (hc + 2)
+        if layer_name == 'sp_padding_mask':
+            _, padded = sequence_parallel_rows(length, parallel)
+            input_size, weight_size, output_size = length, 0, padded  # bool metadata
+        elif layer_name in ('sp_input_padding', 'sp_output_padding'):
+            _, padded = sequence_parallel_rows(length, parallel)
+            # Logical hidden-state boundaries only. Initial padding timing
+            # also includes input_ids; slot/mask/ID metadata is not traffic here.
+            input_size, weight_size, output_size = length * n_embd * fp, 0, padded * n_embd * fp
+        elif layer_name == 'hc_collapse':
+            input_size = length * (residual_width * fp + hc * 4)
+            weight_size, output_size = 0, length * n_embd * fp
+        elif layer_name == 'stack_post':
+            input_size = length * ((n_embd + residual_width) * fp + (hc + hc * hc) * 4)
+            weight_size, output_size = 0, length * residual_width * fp
+        elif layer_name == 'output_projections':
+            groups, rank = config['o_groups'], config['o_lora_rank']
+            if n_head % p or groups % p:
+                raise ValueError('V4.1 output heads and groups must divide TP')
+            input_size = length * (q_dim // p) * fp
+            weight_size = ((q_dim // groups) * (groups * rank // p)
+                           + (groups * rank // p) * n_embd) * fp
+            output_size = length * n_embd * fp
+        else:
+            # Native mHC uses FP32 mixing matrices/coefficients and BF16
+            # residual/input norms. These are logical referenced tensors.
+            fn_width = n_embd if layer_name == 'mhc_pre' and layer_index == 0 else residual_width
+            weight_size = mixes * fn_width * 4 + (3 + mixes) * 4 + n_embd * fp
+            if layer_name == 'mhc_pre':
+                input_size = length * (residual_width * fp + hc * 4)
+                output_size = length * (n_embd * fp + mixes * 4)
+            else:
+                input_size = length * ((n_embd + residual_width) * fp + (hc * hc + 2 * hc) * 4)
+                output_size = length * ((n_embd + residual_width) * fp + mixes * 4)
+
     # ----------------- Embedding & Norms -----------------
-    if layer_name in ("embedding", "mtp_embed"):
+    elif layer_name in ("embedding", "mtp_embed"):
         # ``mtp_embed`` is the drafter's own embed_tokens -- the same shape as
         # the target's, and a separate table: vLLM's MTP wrappers build one
         # rather than sharing.

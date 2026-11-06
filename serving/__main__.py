@@ -22,7 +22,9 @@ from serving.core.utils import (config_weight_dtype, config_kv_cache_dtype,
                                 num_mtp_layers, get_architecture)
 from serving.core.hardware_defaults import apply_hardware_defaults, load_hardware_yaml
 from serving.core.cudagraph import resolve_graph_config, resolve_dp_shapes
-from profiler.core.bundle_metadata import read_bundle
+from serving.core.communication import dtype_bytes
+from serving.core.native_memory import native_page_pool, validate_native_workload
+from profiler.core.bundle_metadata import read_bundle, read_tp
 from profiler.core.execution_metadata import select_execution, graph_options, precision_scope
 from serving.core.spec_decode import AcceptanceModel, published_defaults
 from serving.core.controller import *
@@ -240,10 +242,42 @@ def _resolve_mem_util(instance, cli_default):
     return util
 
 
+def _resolve_native_page_pool(instance, runtime):
+    model = instance['model_name']
+    config = get_config(model)
+    tp = instance.get('tp_size', 1)
+    dp = instance.get('dp_group_size', 1)
+    if (config.get('model_type') not in ('deepseek_v41', 'deepseek_v41_text')
+            or dp <= 1):
+        return None
+    if (instance.get('pd_type') is not None or runtime['enable_local_offloading']
+            or runtime['enable_attn_offloading'] or runtime['num_speculative_tokens']):
+        raise NotImplementedError('Native V4.1 page-pool admission covers local target serving')
+    root = (Path(__file__).resolve().parents[1] / 'profiler' / 'perf'
+            / instance['hardware'] / model / resolve_variant(config))
+    record = read_tp(root / f'tp{tp}', 'native_memory')
+    scope = dict(tp_size=tp, pp_size=instance.get('pp_size', 1), dp_size=dp,
+                 ep_size=instance.get('ep_total', 1), runner=runtime['cudagraph'].runner,
+                 **{key: runtime[key] for key in ('block_size', 'max_num_seqs',
+                    'max_num_batched_tokens', 'enable_prefix_caching', 'enable_chunked_prefill')})
+    return native_page_pool(record, get_source_config(model), scope)
+
+
 def _build_instance_runtime_configs(instances, args, dtype_to_bits):
     runtime_configs = []
     for instance_id, instance in enumerate(instances):
         dtype, kv_cache_dtype = _resolve_instance_dtypes(instance, dtype_to_bits)
+        activation_bits = dtype_to_bits[dtype]
+        model_config = get_config(instance['model_name'])
+        if model_config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text'):
+            # The checkpoint variant selects weight measurements (FP8 dense,
+            # MXFP4 experts). Residuals and the MoE input retain the
+            # checkpoint activation dtype.
+            activation = model_config.get('torch_dtype') or model_config.get('dtype')
+            activation_width = dtype_bytes(activation, None)
+            if activation_width != 2:
+                raise NotImplementedError('V4.1 requires a declared 16-bit activation layout')
+            activation_bits = activation_width * 8
 
         enable_attn_offloading = instance.get("enable_attn_offloading", args.enable_attn_offloading)
         enable_sub_batch_interleaving = instance.get(
@@ -266,7 +300,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 "long_prefill_token_threshold", args.long_prefill_token_threshold),
             "block_size": _resolve_block_size(instance, args),
             "dtype": dtype,
-            "fp": dtype_to_bits[dtype],
+            "fp": activation_bits,
             "kv_cache_dtype": kv_cache_dtype,
             "enable_chunked_prefill": instance.get(
                 "enable_chunked_prefill", args.enable_chunked_prefill),
@@ -672,6 +706,20 @@ def main():
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
+    admitted_workloads = set()
+    for instance, runtime in zip(instances, instance_runtime_configs):
+        pool = _resolve_native_page_pool(instance, runtime)
+        runtime['native_page_pool'] = pool
+        if pool is None:
+            continue
+        if enable_prefix_sharing or not is_init:
+            raise NotImplementedError('Native page pools require ordinary prefill and no prefix sharing')
+        runtime['kv_cache_dtype'] = pool.kv_cache_dtype
+        key = (pool, runtime['enable_prefix_caching'])
+        if key not in admitted_workloads:
+            validate_native_workload(f'../{dataset}' if dataset else None, pool,
+                                     runtime['enable_prefix_caching'], num_req)
+            admitted_workloads.add(key)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
@@ -790,6 +838,7 @@ def main():
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
             async_scheduling=inst_cfg["async_scheduling"],
+            native_page_pool=inst_cfg["native_page_pool"],
             acceptance_model=_build_acceptance_model(
                 instance["model_name"], inst_cfg, instance["node_id"], instance_id),
         ))
@@ -1090,6 +1139,7 @@ def main():
                                        dp_sum_total_len=sum_total_len,
                                        dp_min_total_len=min_total_len,
                                        dp_token_counts=tuple(round_batches[m][0].total_len for m in dp_groups[dg]),
+                                       dp_valid_token_counts=tuple(sum(round_batches[m][0].q_list) if round_batches[m][0].requests else 0 for m in dp_groups[dg]),
                                        dp_rank=dp_rank,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root,
@@ -1182,6 +1232,7 @@ def main():
                                            dp_sum_total_len=sum_total_len,
                                            dp_min_total_len=min_total_len,
                                            dp_token_counts=tuple(round_batches[m][0].total_len for m in dp_groups[dg]),
+                                           dp_valid_token_counts=tuple(sum(round_batches[m][0].q_list) if round_batches[m][0].requests else 0 for m in dp_groups[dg]),
                                            dp_rank=dp_rank,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root,
