@@ -51,6 +51,9 @@ Do this first — it characterises the machine, not a model, and the same file
 serves every model bundle in the folder. Re-measure after interconnect or
 communication-software changes.
 
+For a group spanning nodes, use `python3 -m profiler.hardware_multinode`; see
+the [hardware multi-node CLI reference](../reference/hardware-multinode-cli.md).
+
 **It needs two of the cards.** With one, the spec section is still written,
 `interconnect` is `null` with the reason, and the command exits non-zero; a
 cluster config then has to set `link_bw` and `link_latency` explicitly. That is

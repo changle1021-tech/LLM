@@ -14,6 +14,9 @@ compares a finished run against simulator output.
 `validate` only reads recorded files and runs on CPU in the simulator
 environment. It neither starts a vLLM engine nor requires a GPU.
 
+`python -m bench.http_trace` is a separate open-loop HTTP client documented
+[below](#open-loop-http-trace-client); it is not a `python -m bench` subcommand.
+
 For the resulting accuracy numbers, see
 **[Validation](/docs/validation)**.
 
@@ -263,6 +266,128 @@ see [metric definitions](/docs/validation#metric-definitions).
 The simulator's CSV exposes `arrival`, `end_time`, and a per-token ITL
 list directly; bench derives the same fields from vLLM's
 `RequestStateStats`.
+
+## Open-loop HTTP trace client
+
+`python -m bench.http_trace` sends requests to a running OpenAI-compatible
+server on scheduled deadlines and writes simulator workload JSONL from the
+server's recorded arrival times. It is a standalone module, **not** a new
+subcommand of `python -m bench`, and its output is not the `bench run` artifact
+schema; do not pass it to `python -m bench validate`.
+
+The server must load `bench.arrival_middleware.ArrivalMiddleware` at startup.
+From the repository root (or an environment where the repository root is on
+`PYTHONPATH`), append the middleware to the vLLM server command:
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" vllm serve <hf-model-or-path> \
+    --middleware bench.arrival_middleware.ArrivalMiddleware
+```
+
+Restart the vLLM server process after adding the middleware; rebuilding the
+container is not required. The middleware stamps every HTTP request carrying
+`x-llmsim-request-id` (including the client's `/v1/models` preflight and
+`/v1/completions` requests), records monotonic and Unix arrival timestamps at
+the ASGI entry point, and echoes those timestamps, a clock ID, and the request
+ID in response headers. It does not change sampling, graph capture, or
+scheduling.
+
+Run the client from the repository root. This example samples distinct
+requests from an existing flat project workload; the dataset's original
+arrival times are ignored and requests are rescheduled at the selected QPS.
+Sampling is without replacement, so the dataset must contain at least as many
+eligible rows as `--num-requests`. Rows with `sub_requests` are rejected.
+
+```bash
+python -m bench.http_trace \
+    --base-url http://127.0.0.1:8000 \
+    --model <served-api-model-id> \
+    --dataset workloads/sharegpt-llama-3.1-8b-300-sps10.jsonl \
+    --num-requests 100 --qps 2 --arrival-pattern fixed \
+    --output-dir bench/results/http-trace-<run-id>
+```
+
+Dataset rows must have nonempty `input_tok_ids`. The client selects
+`--num-requests` eligible rows without replacement using `--seed` and preserves
+their input and output lengths by default. Set `--input-len N` to keep only
+prompts with at least N tokens and truncate them to N; set `--output-len N` to
+override their requested output lengths. If no dataset is supplied, the client
+uses `--tokenizer` (defaulting to `--model`) to sample non-special token IDs;
+synthetic prompts and outputs default to 4096 tokens each. `--token-id` is a
+diagnostic option that avoids tokenizer loading and uses the explicitly given
+ID.
+
+The client options are:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--base-url` | `http://127.0.0.1:8000` | OpenAI-compatible server base URL |
+| `--model` | required | Served API model ID |
+| `--dataset` | unset | Project-format JSONL source; flat rows with nonempty `input_tok_ids` only |
+| `--tokenizer` | `--model` | HF ID or local tokenizer for synthetic prompts |
+| `--num-requests` | `100` | Number of requests to sample or synthesize |
+| `--qps` | required | Planned arrival rate |
+| `--arrival-pattern` | `fixed` | `fixed` or `poisson` open-loop deadlines |
+| `--input-len`, `--output-len` | mode-dependent | Synthetic defaults are 4096 each; dataset mode preserves source lengths unless overridden |
+| `--max-inflight` | unlimited | At capacity, mark the scheduled request failed rather than defer it |
+| `--timeout` | `3600` | Per-request timeout in seconds |
+| `--seed` | `42` | Repeatable sampling without replacement and synthetic token selection |
+| `--output-dir` | required | New output directory; it must not already exist |
+| `--api-key-env` | `OPENAI_API_KEY` | Environment variable containing the API key |
+| `--token-id` | unset | Use this explicit token ID for diagnostic synthetic input without loading a tokenizer |
+
+The client submits on open-loop deadlines. Reaching `--max-inflight` records a
+failed request instead of delaying it and changing the planned QPS. Fixed QPS
+is therefore the schedule (Poisson arrivals are also available); actual arrival
+times come from the server headers, never from client-side timestamps.
+If a response lacks those headers or a request fails, the command exits
+nonzero. If receipts establish one server clock domain, it writes
+`trace.partial.jsonl` (successful replay rows only), never a formal
+`trace.jsonl`; without receipts or with mixed clock domains, it writes no replay
+JSONL. On a successful run it writes `trace.jsonl` with actual input/output usage,
+`input_tok_ids`, and `arrival_time_ns` expressed as server monotonic time since
+the first arrival; `requests.jsonl` retains scheduled, send, receive, and error
+times, while `summary.json` reports planned and actual QPS. The raw server
+timestamps are retained as additional trace fields.
+
+The client prints per-second progress and writes `metrics.json` with
+success/failure/unsent counts, full run duration (first dispatch through the
+last dispatched request's completion), successful request/input/output-token
+throughput over that duration, and client-observed latency distributions
+(`n`, mean, P50, P90, P95, P99). E2E latency spans client dispatch to
+completion. The reported `TTFT_obs` spans dispatch to the first observed text
+chunk; new captures use the first nonempty text chunk, while historical
+captures may include an empty first choices chunk. `TPOT_est` is the span from
+the first to last nonempty text chunk divided by actual output tokens minus
+one; it requires more than one nonempty text chunk and more than one output
+token. These are client observations, not engine latency measurements, and no
+server timestamp is subtracted from a client clock. Older `requests.jsonl`
+files without last-chunk timestamps can still provide E2E and `TTFT_obs`, but
+cannot provide `TPOT_est`.
+
+Recompute and print metrics from any existing capture directory with:
+
+```bash
+python -m bench.http_metrics bench/results/<run_id>
+```
+
+The analyzer reads that directory's `requests.jsonl` and writes `metrics.json`.
+
+Replay a successful trace with the simulator's ordinary dataset interface:
+
+```bash
+python -m serving \
+    --cluster-config configs/cluster/<cluster>.json \
+    --dataset bench/results/http-trace-<run-id>/trace.jsonl \
+    --output outputs/http-trace-<run-id>.csv
+```
+
+Arrival timestamps are measured in one server monotonic clock domain and are
+valid for a single service host. Do not combine runs from different machines:
+their monotonic clocks are unrelated. The measurement boundary is the HTTP
+service's ASGI entry point; it does not measure NIC packet arrival, engine
+enqueue, or GPU start time. There is no client-clock fallback for missing
+server timestamps.
 
 :::caution[`prompt_throughput` is not comparable tick-for-tick]
 vLLM counts a prompt once, at prefill completion, so its

@@ -11,6 +11,9 @@ same dataset.
 bench/                         Python package: python -m bench
 ├── __init__.py                 package marker + module map
 ├── __main__.py                 CLI dispatch (run / validate)
+├── http_trace.py               open-loop HTTP client; writes simulator replay JSONL
+├── http_metrics.py             report client-observed metrics from request records
+├── arrival_middleware.py       ASGI ingress timestamps for tagged HTTP requests
 ├── core/                       internals
 │   ├── runner.py               AsyncLLM driver, captures RequestStateStats
 │   ├── recorder.py             writes meta.json / requests.jsonl / timeseries.csv
@@ -37,6 +40,8 @@ bench/                         Python package: python -m bench
 
 `bench run` needs the vLLM GPU environment. `bench validate` only reads recorded
 files and runs on CPU in the simulator environment; it does not boot vLLM.
+For open-loop requests against a separately running vLLM HTTP server, see the
+[HTTP trace client guide](../docs/docs/reference/bench-cli.md#open-loop-http-trace-client).
 The shared launcher targets vLLM 0.31.0 / CUDA 13. Committed reference runs
 retain the versions in their metadata; changing the launcher does not refresh them.
 The committed examples validate their stored profile bundles, not automatically

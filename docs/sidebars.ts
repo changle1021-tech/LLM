@@ -143,6 +143,8 @@ const sidebars: SidebarsConfig = {
         'reference/pim-config',
         'reference/trace-format',
         'reference/bench-cli',
+        'reference/bench-multinode-cli',
+        'reference/hardware-multinode-cli',
       ],
     },
     'artifact-evaluation',

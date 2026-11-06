@@ -262,9 +262,10 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     # Retain the benchmark's separate compute/communication decomposition.
     # Backend selection is independent: these two disabled compiler passes
     # do not enforce NCCL-only or disable model-native fused operations.
-    compilation_config = CompilationConfig(pass_config=PassConfig(
-        fuse_allreduce_rms=False, fuse_gemm_comms=False,
-    ))
+    compilation_config = CompilationConfig(
+        pass_config=PassConfig(fuse_allreduce_rms=False, fuse_gemm_comms=False),
+        cudagraph_capture_sizes=[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,512,1024,2048],
+    )
     engine_args = AsyncEngineArgs(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
