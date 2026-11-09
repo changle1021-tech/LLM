@@ -14,6 +14,8 @@ live with their module.
 | `compile.sh`      | Build ASTRA-Sim's analytical backend and install the Chakra trace converter. Rerun it after any change under `astra-sim/`, including `llm_converter.py`, which is installed into site-packages rather than imported from the tree. |
 | `monitor_run.py` | Run one command with process-tree RSS, host-memory, swap-growth and timeout guards; write CSV telemetry and a JSON completion summary. Optional GPU telemetry targets one explicit physical UUID. |
 | `ns3-network-plots.py` | Read retained ns-3 network monitor CSVs and generate offline interactive port-throughput, utilization and configured-QP-rate charts. Uses the Python standard library. See the [monitoring guide](../docs/docs/simulator/ns3-backend.md#network-monitoring). |
+| `comm-plots.py` | Unified plotting entry point for ns-3 serving communication results. From one `ns3/output/` directory it regenerates the interactive HTML plots (`ns3-network-plots.py`) and PNG figures for the GPU-pair matrix, FCT analysis and link-load grouping. |
+| `comm-plots-extra.py` | Complementary numbered PNG figures (utilization heatmap, FCT slowdown vs size/start, message-size spectrum, GPU-pair matrix over time, cumulative bytes, traffic split, per-link ranking, TTFT/TPOT timeline, serving latency/TTFT CDF comparison). Reuses the readers from `comm-plots.py`. |
 
 ## Typical first-time setup
 
