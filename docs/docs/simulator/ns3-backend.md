@@ -42,7 +42,7 @@ For explicit physical topologies, add a top-level `ns3` object. NPU endpoint IDs
 }
 ```
 
-Common cluster `link_bw` is interpreted as GiB/s and converted for ns-3; common `link_latency` is in ns. Common list-valued bandwidth or latency must be uniform. Use explicit `ns3.links` for heterogeneous physical links. Explicit link rates (`bandwidth_gbps`) use decimal Gbit/s, and link latency uses ns. NPU endpoints are not transit switches, so an explicit switched topology must connect every NPU pair through the switch nodes. `packet_payload_size` must be an integer from 64 through 65500. Optional `ns3.config` overrides only keys present in ns-3's checked-in `scratch/config/config.txt`; topology and generated output paths cannot be overridden. Set packet payload through `ns3.packet_payload_size`, rather than through `ns3.config`.
+Common cluster `link_bw` is interpreted as GiB/s and converted for ns-3; common `link_latency` is in ns. Common list-valued bandwidth or latency must be uniform. Use explicit `ns3.links` for heterogeneous physical links. Explicit link rates (`bandwidth_gbps`) use decimal Gbit/s, and link latency uses ns. NPU endpoints are not transit switches, so an explicit switched topology must connect every NPU pair through the switch nodes. `packet_payload_size` must be an integer from 64 through 65500. Optional `ns3.config` overrides keys supported by the checked-in ns-3 template or the frontend monitor settings in `serving/core/ns3_config.py`; topology and generated output paths cannot be overridden. Set packet payload through `ns3.packet_payload_size`, rather than through `ns3.config`.
 
 `ns3.host_dispatch_latency_ns` optionally adds a measured host handoff delay before each model forward (nonnegative integer nanoseconds; default `0`). It represents time between GPU iterations spent on host scheduling, dispatch and result handling; it does not change GPU component latencies or network propagation. TP start/completion controllers sharing the same forward use one dispatch deadline. Use an independent native runtime measurement for the intended executor and workload regime; a delay measured for synchronous Ray TP4 is not a general hardware constant. This option is separate from `async_scheduling`.
 
@@ -59,6 +59,89 @@ instances continue independently; the barrier does not require global idleness.
 Rebuild with `scripts/compile.sh --backend ns3` after updating the driver.
 See [parallelism mechanics](parallelism-mechanics.md#instance-completion-across-ranks)
 for the shared frontend/backend contract.
+
+## Network monitoring
+
+Network monitoring records port throughput and configured RDMA QP rates during
+ordinary ns-3 serving runs. It is enabled independently of `ENABLE_TRACE` and
+does not need PyViz, packet-log conversion or `--save-trace-text`. Rebuild the
+ns-3 backend after updating this feature, then retain a run with `--keep-inputs`:
+
+```bash
+python3 -m serving \
+  --cluster-config configs/cluster/single_node_single_instance.json \
+  --dataset workloads/sharegpt-llama-3.1-8b-300-sps10.jsonl \
+  --network-backend ns3 --run-id network_inspect --keep-inputs \
+  --output outputs/network_inspect.csv
+
+python3 scripts/ns3-network-plots.py \
+  astra-sim/inputs/runs/network_inspect/ns3/output
+```
+
+Open the generated `plots/index.html` in a browser. The plotting command uses
+the Python standard library and produces self-contained interactive HTML;
+network access and additional plotting packages are unnecessary. Node pages
+show port transmit/receive rates and utilization relative to each physical
+link's configured capacity. Node-pair pages show the sum of active QPs'
+configured rates and their active count. Display samples are bounded while
+the raw CSV records remain unchanged. Use `--help` for output-directory and
+display-resolution options.
+
+An example cluster fragment explicitly sets the sampling intervals:
+
+```json
+{
+  "ns3": {
+    "config": {
+      "ENABLE_NETWORK_MONITOR": 1,
+      "BW_MON_INTERVAL_NS": 1000000,
+      "QP_MON_INTERVAL_NS": 10000
+    }
+  }
+}
+```
+
+Intervals are positive integer nanoseconds. Set `ENABLE_NETWORK_MONITOR` to
+`0` to disable this output. The generated `ns3/config.txt` records the effective
+settings; `serving/core/ns3_config.py` defines their defaults and owns output
+paths, which cannot be supplied through `ns3.config`.
+
+### Output schema
+
+The monitor writes these records under the retained run's `ns3/output/`:
+
+| File | Contents |
+| --- | --- |
+| `port_bandwidth.csv` | `time_ns`, `node_id`, `port_id`, `peer_node_id`, `link_bandwidth_bps`, `interval_ns`, `tx_bytes`, `rx_bytes`, `tx_gbps`, `rx_gbps` |
+| `qp_rate.csv` | `time_ns`, `src_node_id`, `dst_node_id`, `src_port`, `dst_port`, `size_bytes`, `rate_bps` |
+| `network_stats.json` | Sampling settings, output row counts, QP lifecycle counts and cumulative port-byte totals |
+
+A port row describes the interval ending at `time_ns`; its byte counts are
+interval deltas. Every physical port has an initial zero baseline, followed
+by fixed windows, including idle windows, and a final partial window when
+needed. `peer_node_id` maps the port to its adjacent node; parallel physical
+links retain separate port identities. Bytes include packet headers and
+control traffic. Transmission is counted at PHY start and reception at
+successful MAC delivery. Charging a whole packet at the boundary can make a
+short window's rate exceed physical capacity; these counters measure packet
+throughput, not application goodput or a reconstructed bit-level waveform.
+
+QP rows capture the first observed transmission, sampled changes in the
+configured sending rate, and an actual-completion marker with `rate_bps=0`.
+This rate is congestion-control state, not achieved throughput. Summing QP
+rates for a node pair does not measure the capacity of its multi-hop path.
+
+Sampling observes existing network events and serving steps rather than
+adding simulator events. The monitor flushes a final partial window at
+shutdown. It does not extend the legacy `qlen.txt` observation window or
+manufacture PFC events: queue output can be empty when no qualifying queue
+sample occurs, and `pfc.txt` can be empty when no PFC event occurs.
+
+The periodic byte-counter sampling design follows
+[SimAI/ns-3-alibabacloud](https://github.com/aliyun/ns-3-alibabacloud), with a
+frontend implementation that uses the current serving event loop.
+
+## Collective probes
 
 Analytical `collective_links` timing overrides do not have a packet-level equivalent and are rejected for ns-3 runs. To sample primitive collective behavior independently, use the probe script:
 

@@ -2199,6 +2199,21 @@ head-rank admission, and rebuild the ns-3 executable after changing its driver.
 Validate with a slower middle rank and with a managed rank already executing
 the next iteration; completion must wait only for the target iteration.
 
+### ns-3 network observations
+
+`serving/core/ns3_config.py` owns generated monitor paths and settings;
+`astra-sim/astra-sim/network_frontend/ns3/NetworkMonitor.hh` observes existing
+packet traces and serving steps. Monitoring must not schedule extra simulator
+events or change serving idle advancement. Port counters measure packet bytes
+at PHY transmission start and successful MAC reception, including headers and
+control packets; they are not application goodput. Preserve peer-node and port
+identities, including parallel links. QP configured rates are distinct from
+achieved throughput; only actual QP completion emits the zero-rate completion
+marker. Keep monitor units in explicit field names, retain raw CSVs when
+downsampling display points, and keep plotting independent of simulator Python
+dependencies. See the [monitoring guide](docs/docs/simulator/ns3-backend.md#network-monitoring)
+and `scripts/ns3-network-plots.py --help` for usage.
+
 ### Working directory
 Run `python -m serving` from the repository root. The entry point changes cwd
 to `astra-sim/` internally, but relative cluster, dataset, output and gate-stat

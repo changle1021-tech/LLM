@@ -20,6 +20,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   cache, ASTRA-Sim networking, heterogeneous and disaggregated systems, model
   architectures and workloads, and the research section lists all three
   LLMServingSim publications.
+- Record ns-3 port throughput and configured RDMA QP rates independently of
+  packet tracing, with peer-node mapping and an offline interactive plotting
+  command. Counter observation adds no simulator events. Retain the run with
+  `--keep-inputs` and rebuild the ns-3 backend before using the new outputs.
+  The sampling design follows SimAI/ns-3-alibabacloud. See
+  [network monitoring](https://llmservingsim.ai/docs/simulator/ns3-backend#network-monitoring).
 
 ### Fixed
 

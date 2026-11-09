@@ -101,7 +101,9 @@ def prepare_ns3_inputs(astra_sim, run_paths, cluster, options=None):
         raise ValueError('ns3.packet_payload_size must be an integer between 64 and 65500')
     replacements={'TOPOLOGY_FILE':str(topology),'PACKET_PAYLOAD_SIZE':str(payload)}
     for key,name in [('FLOW_FILE','flow.txt'),('TRACE_FILE','trace.txt'),('TRACE_OUTPUT_FILE','mix.tr'),
-                     ('FCT_OUTPUT_FILE','fct.txt'),('PFC_OUTPUT_FILE','pfc.txt'),('QLEN_MON_FILE','qlen.txt')]:
+                     ('FCT_OUTPUT_FILE','fct.txt'),('PFC_OUTPUT_FILE','pfc.txt'),('QLEN_MON_FILE','qlen.txt'),
+                     ('BW_MON_FILE','port_bandwidth.csv'),('RATE_MON_FILE','qp_rate.csv'),
+                     ('NETWORK_MONITOR_SUMMARY_FILE','network_stats.json')]:
         replacements[key]=str(output/name)
     for key in ('FLOW_FILE','TRACE_FILE'):
         Path(replacements[key]).write_text('0\n')
@@ -119,14 +121,24 @@ def prepare_ns3_inputs(astra_sim, run_paths, cluster, options=None):
         parts=line.split(maxsplit=1)
         if parts:settings[parts[0]]=parts[1] if len(parts)>1 else ''
     settings['ENABLE_TRACE']='0'
+    # Frontend-owned monitor keys do not require changes to the ns-3 template.
+    # Unlike packet tracing, periodic counter output is small enough for normal runs.
+    settings.update(ENABLE_NETWORK_MONITOR='1', BW_MON_INTERVAL_NS='1000000',
+                    QP_MON_INTERVAL_NS='10000')
     overrides=options.get('config',{})
     if not isinstance(overrides,dict) or set(overrides)-set(settings):
         raise ValueError('ns3.config must contain supported template keys')
-    if set(overrides)&{'TOPOLOGY_FILE','FLOW_FILE','TRACE_FILE','TRACE_OUTPUT_FILE','FCT_OUTPUT_FILE','PFC_OUTPUT_FILE','QLEN_MON_FILE'}:
+    if set(overrides)&{'TOPOLOGY_FILE','FLOW_FILE','TRACE_FILE','TRACE_OUTPUT_FILE','FCT_OUTPUT_FILE','PFC_OUTPUT_FILE','QLEN_MON_FILE',
+                       'BW_MON_FILE','RATE_MON_FILE','NETWORK_MONITOR_SUMMARY_FILE'}:
         raise ValueError('ns3 output and topology paths are generated per run')
     if 'PACKET_PAYLOAD_SIZE' in overrides:
         raise ValueError('Use ns3.packet_payload_size to set the packet payload')
     for key,value in overrides.items():
+        if key == 'ENABLE_NETWORK_MONITOR' and (type(value) not in (bool, int) or value not in (0, 1)):
+            raise ValueError('ns3.config.ENABLE_NETWORK_MONITOR must be 0 or 1')
+        if key in {'BW_MON_INTERVAL_NS', 'QP_MON_INTERVAL_NS'} and (
+                type(value) is not int or not 1 <= value <= (2**63 - 1) // 2):
+            raise ValueError(f'ns3.config.{key} must be a positive integer in ns')
         if isinstance(value,(list,dict)) or '\n' in str(value) or '\r' in str(value):
             raise ValueError(f'Invalid ns3 config value for {key}')
         settings[key]=str(int(value) if isinstance(value, bool) else value)

@@ -2,6 +2,11 @@
 
 LLMServingSim simulator core. Run as `python -m serving --cluster-config <...> [...]`.
 
+For packet-level network simulation, select `--network-backend ns3` and retain
+its network counters with `--keep-inputs`. See the
+[ns-3 monitoring guide](../docs/docs/simulator/ns3-backend.md#network-monitoring)
+for port throughput, configured QP rates and offline interactive plots.
+
 When comparing a new DP benchmark, match each instance's KV pool to the
 corresponding complete `kv_cache.capacity.per_engine` observation, not the
 frontend's aggregate block count. This does not change the simulator's memory

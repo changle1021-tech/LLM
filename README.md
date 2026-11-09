@@ -53,6 +53,9 @@ to synchronize submodules and rebuild ASTRA-Sim and Chakra.
 Simulation and comparison against recorded benchmarks are **CPU-only**.
 GPU profiling and new benchmarks target **vLLM 0.31.0 / CUDA 13**.
 
+The optional [ns-3 backend](https://llmservingsim.ai/docs/simulator/ns3-backend)
+also records network counters for offline interactive bandwidth plots.
+
 CLI references: [simulator](https://llmservingsim.ai/docs/reference/cli-flags),
 [profiler](https://llmservingsim.ai/docs/profiler/running#calling-python--m-profiler-directly),
 [bench](https://llmservingsim.ai/docs/reference/bench-cli), and

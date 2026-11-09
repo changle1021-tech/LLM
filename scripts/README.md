@@ -13,6 +13,7 @@ live with their module.
 | `install-vllm.sh` | Bare-metal vLLM 0.31.0 install into the repository's Python 3.12 `.venv`. Uses uv's `cu130` PyTorch backend, installs the same extras and NCCL pin, then applies the same source patches as Docker. |
 | `compile.sh`      | Build ASTRA-Sim's analytical backend and install the Chakra trace converter. Rerun it after any change under `astra-sim/`, including `llm_converter.py`, which is installed into site-packages rather than imported from the tree. |
 | `monitor_run.py` | Run one command with process-tree RSS, host-memory, swap-growth and timeout guards; write CSV telemetry and a JSON completion summary. Optional GPU telemetry targets one explicit physical UUID. |
+| `ns3-network-plots.py` | Read retained ns-3 network monitor CSVs and generate offline interactive port-throughput, utilization and configured-QP-rate charts. Uses the Python standard library. See the [monitoring guide](../docs/docs/simulator/ns3-backend.md#network-monitoring). |
 
 ## Typical first-time setup
 
