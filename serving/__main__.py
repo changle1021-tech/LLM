@@ -642,8 +642,18 @@ def main():
                         help='interval in seconds between throughput/memory usage log messages')
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], default='WARNING',
                         help='logging verbosity: WARNING (minimal), INFO (per-iteration details), DEBUG (per-layer memory)')
-    parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
-                        help='network simulation backend: analytical (fast, default) or ns3 (packet network)')
+    parser.add_argument('--network-backend', type=str, choices=['analytical', 'analytical-ca', 'ns3'], default='analytical',
+                        help='network simulation backend: analytical (congestion-unaware, fast, default), '
+                        'analytical-ca (congestion-aware analytical, 1-D topology only), or ns3 (packet network)')
+    parser.add_argument('--ca-topology', type=str, choices=['Switch', 'Ring', 'FullyConnected', 'TwoTierSwitch'], default='Switch',
+                        help='congestion-aware analytical topology type (only used with --network-backend analytical-ca): '
+                        'Switch (shared central switch), Ring (shared ring links), FullyConnected (private links, no contention), '
+                        'or TwoTierSwitch (per-node NVLink + leaf-spine fabric; needs "intra_node" cluster links)')
+    parser.add_argument('--analytical-topology', type=str,
+                        choices=['FullyConnected', 'Ring', 'Switch', 'TwoTierSwitch'], default='FullyConnected',
+                        help='congestion-unaware analytical topology type (only used with --network-backend analytical): '
+                        'FullyConnected (private links, default), Ring (shared ring links), Switch (shared central switch), '
+                        'or TwoTierSwitch (per-node NVLink + leaf-spine fabric; needs "intra_node" cluster links)')
 
     args = parser.parse_args()
     
@@ -685,7 +695,8 @@ def main():
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
         astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
-        inputs_root=run_paths.inputs_root)
+        inputs_root=run_paths.inputs_root, network_backend=network_backend,
+        ca_topology=args.ca_topology, analytical_topology=args.analytical_topology)
     if cluster.get("collective_links") and network_backend != 'analytical':
         raise ValueError("collective_links requires the congestion-unaware analytical backend")
     num_nodes = cluster["num_nodes"]
@@ -727,12 +738,15 @@ def main():
     if network_backend == 'analytical':
         network=run_paths.network_config
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
+    elif network_backend == 'analytical-ca':
+        network=run_paths.network_config
+        binary=os.path.join(astra_sim, "build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware")
     elif network_backend == 'ns3':
         network, logical_topology = prepare_ns3_inputs(
             astra_sim, run_paths, cluster, raw_cluster_config.get("ns3"))
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-optimized")
     else:
-        raise NotImplementedError("Only analytical and ns3 network backend are supported")
+        raise NotImplementedError("Only analytical, analytical-ca and ns3 network backends are supported")
     memory=run_paths.memory_config
     system=run_paths.system_config
     # ------------------------------------- Prepare simulation -------------------------------------

@@ -35,6 +35,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   `--keep-inputs` and rebuild the ns-3 backend before using the new outputs.
   The sampling design follows SimAI/ns-3-alibabacloud. See
   [network monitoring](https://llmservingsim.ai/docs/simulator/ns3-backend#network-monitoring).
+- Add a congestion-aware analytical backend with `--ca-topology` and a
+  congestion-unaware topology selector, `--analytical-topology`. Both offer
+  `Switch`, `Ring`, `FullyConnected` and `TwoTierSwitch`. The two-tier topology
+  uses explicit node counts and separate local/fabric link settings.
+  Congestion-aware and two-tier configurations require 1-D rank layouts;
+  leading size-1 dimensions and matching collective scopes are collapsed
+  together. Configured collective implementations are preserved. Rebuild
+  the analytical backends; packet queues and congestion control remain
+  specific to ns-3.
 
 ### Fixed
 

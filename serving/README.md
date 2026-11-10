@@ -112,7 +112,7 @@ from one list is visible against the other.
 | **speculative decoding** | `--num-speculative-tokens`, `--spec-acceptance-rate`, `--spec-acceptance-policy` |
 | **offloading** | `--enable-attn-offloading`, `--enable-sub-batch-interleaving`, `--enable-local-offloading` |
 | **trace / graph** | `--enable-block-copy`; run-wide: `--save-trace-text`, `--keep-inputs` |
-| **backend** *(run-wide)* | `--network-backend` |
+| **backend** *(run-wide)* | `--network-backend` (`analytical` \| `analytical-ca` \| `ns3`), `--ca-topology`, `--analytical-topology` |
 | **output** *(run-wide)* | `--output`, `--run-id`, `--inputs-root`, `--log-interval`, `--log-level` |
 
 The reversible switches also accept `--no-enable-block-copy`,
@@ -557,7 +557,15 @@ first: `[tp_size, dp_group_size]`, or `[tp_size, pp_size, dp_group_size]` when
 `pp_size > 1`, matching vLLM's `all_ranks.reshape(-1, dp, pp, pcp, tp)`. The
 `system.json` collective implementations are sized to match the number of topology
 dimensions. Computes `tp_dim`/`ep_dim` per instance for `involved_dim` scoping; EP is
-scoped to the DP and TP dims and never PP.
+scoped to the DP and TP dims and never PP. The congestion-aware analytical backend
+(`--network-backend analytical-ca`) is 1-D only: a leading size-1 dimension is
+collapsed and the matching `involved_dim` entries and per-dimension link settings
+are dropped with it. `--ca-topology` and `--analytical-topology` select
+`Switch`, `Ring`, `FullyConnected` or `TwoTierSwitch` for their respective
+backends. TwoTierSwitch also requires a 1-D topology, `num_nodes` and
+`intra_node.link_bw` / `intra_node.link_latency`: local pairs use direct
+fast links and cross-node pairs traverse leaf/spine links. System collective
+implementation choices are retained when their dimension count is adjusted.
 
 ### `power_model.py`
 

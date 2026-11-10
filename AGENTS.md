@@ -2216,6 +2216,15 @@ head-rank admission, and rebuild the ns-3 executable after changing its driver.
 Validate with a slower middle rank and with a managed rank already executing
 the next iteration; completion must wait only for the target iteration.
 
+### Analytical topology selection
+
+`--ca-topology` selects the congestion-aware topology; `--analytical-topology`
+selects the congestion-unaware topology. Both accept `TwoTierSwitch`, with
+cluster `num_nodes` and `intra_node.link_bw` / `intra_node.link_latency` for
+the faster local tier. TwoTierSwitch is flat and 1-D; keep network dimensions,
+collective implementation arity and `involved_dim` scopes aligned. Preserve
+configured collective implementations when adjusting their arity.
+
 ### ns-3 network observations
 
 `serving/core/ns3_config.py` owns generated monitor paths and settings;

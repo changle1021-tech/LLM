@@ -22,7 +22,18 @@ heterogeneous instances. Flags without that marker remain run-wide. See
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cluster-config` | path | `configs/cluster/single_node_single_instance.json` | Path to a cluster-config JSON. See **[Cluster config](./cluster-config)** |
-| `--network-backend` | choice | `analytical` | Network simulation backend: `analytical` (fast) or `ns3` (packet-level) |
+| `--network-backend` | choice | `analytical` | Network simulation backend: `analytical` (congestion-unaware, fast), `analytical-ca` (congestion-aware analytical, 1-D topology only), or `ns3` (packet-level) |
+| `--ca-topology` | choice | `Switch` | Congestion-aware analytical topology: `Switch`, `Ring`, `FullyConnected`, or `TwoTierSwitch`. Only used with `--network-backend analytical-ca` |
+| `--analytical-topology` | choice | `FullyConnected` | Congestion-unaware analytical topology: `FullyConnected`, `Ring`, `Switch`, or `TwoTierSwitch`. Only used with `--network-backend analytical` |
+
+`TwoTierSwitch` requires a 1-D rank topology and cluster `num_nodes`, plus
+`intra_node: {"link_bw": 112.0, "link_latency": 0.0}` for local links.
+Bandwidth is in GB/s and latency is in ns, as with the top-level fabric
+`link_bw` and `link_latency`. The total NPU count must divide evenly across
+nodes. Local pairs use direct links; cross-node routes traverse leaf and
+spine switches. This analytical topology does not reproduce ns-3 packet
+queues or congestion-control dynamics. Rebuild the analytical backends
+after updating their topology implementation.
 
 ## Batching and scheduling
 
@@ -158,6 +169,8 @@ removed after a successful simulation by default.
 | PIM attention offload | `--enable-attn-offloading` (cluster config sets `pim_config`) |
 | FP8 KV cache | (model config `quantization_config.kv_cache_scheme`) |
 | ns3 backend | `--network-backend ns3` |
+| Congestion-aware analytical backend | `--network-backend analytical-ca`, `--ca-topology` |
+| Congestion-unaware analytical topology | `--network-backend analytical`, `--analytical-topology` |
 | Heterogeneous instances in one run | (cluster config per-instance overrides; see the tip above) |
 
 For the full conceptual treatment of each feature, browse the

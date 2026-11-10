@@ -134,7 +134,15 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
-def _resolve_dp_groups(all_instances):
+def _collapse_leading_ones(dims):
+    """Count leading size-1 dimensions (the 1-D backend cannot express them)."""
+    drop = 0
+    while drop < len(dims) and dims[drop] == 1:
+        drop += 1
+    return drop
+
+
+def _resolve_dp_groups(all_instances, collapse_1d=False):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
     dp_groups = {}
     for inst in all_instances:
@@ -224,8 +232,21 @@ def _resolve_dp_groups(all_instances):
             inst["tp_dim"] = local_dim
             inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 
+    # The 1-D-only congestion-aware backend cannot express a leading size-1
+    # dimension (e.g. tp_size=1 in a [1, dp_group_size] topology). Strip those
+    # leading dimensions and the matching leading involved_dim entries so the
+    # emitted trace stays arity-consistent with the collapsed network.yml.
+    if collapse_1d:
+        drop = _collapse_leading_ones(_compute_network_dims(all_instances))
+        if drop:
+            for inst in all_instances:
+                for key in ("tp_dim", "ep_dim"):
+                    dims = inst.get(key)
+                    if dims is not None:
+                        inst[key] = dims[drop:]
 
-def _compute_network_dims(instances):
+
+def _compute_network_dims(instances, collapse_1d=False):
     """Infer ASTRA-Sim topology dimensions from resolved instances."""
     dp_groups = {}
     for inst in instances:
@@ -273,6 +294,13 @@ def _compute_network_dims(instances):
     # Remove trailing 1s (single-element dimensions are unnecessary).
     while len(dims) > 1 and dims[-1] == 1:
         dims.pop()
+    if collapse_1d:
+        # The congestion-aware backend and the congestion-unaware TwoTierSwitch
+        # are both 1-D only. Strip leading size-1 dimensions (e.g. tp_size=1 in
+        # a [1, dp_group_size] topology) so the remaining single dimension holds
+        # every collective rank.
+        while len(dims) > 1 and dims[0] == 1:
+            dims.pop(0)
     return dims
 
 
@@ -301,21 +329,25 @@ def _normalize_network_dim_values(raw_value, num_dims, field_name):
         ) from exc
 
 
-def _sync_system_collective_dims(system_config_path, instances):
+def _sync_system_collective_dims(system_config_path, instances, collapse_1d=False):
     """Match system collective implementation arity to final topology dims."""
     with open(system_config_path) as f:
         system_config = json.load(f)
 
-    num_dims = len(_compute_network_dims(instances))
+    num_dims = len(_compute_network_dims(instances, collapse_1d))
     for key in _COLLECTIVE_IMPL_KEYS:
-        system_config[key] = ["ring"] * num_dims
+        base = system_config.get(key) or ["ring"]
+        if len(base) == num_dims:
+            system_config[key] = list(base)
+        else:
+            system_config[key] = [base[0]] * num_dims
 
     with open(system_config_path, "w", encoding="utf-8") as f:
         json.dump(system_config, f, ensure_ascii=False, indent=2)
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None, network_backend='analytical', ca_topology='Switch', analytical_topology='FullyConnected'):
     # Relative paths are read from the repo root, one level out of astra-sim,
     # which is the cwd by now. An absolute path is already complete --
     # ``__main__._cluster_config_path`` has always honoured that, and this
@@ -356,6 +388,13 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     
     link_bw = cluster_config["link_bw"]
     link_latency = cluster_config["link_latency"]
+
+    # Optional intra-node (NVLink) link overrides for the TwoTierSwitch CA
+    # topology. ``link_bw`` / ``link_latency`` describe the inter-node fabric;
+    # ``intra_node`` describes the faster in-node links.
+    intra_node = cluster_config.get("intra_node")
+    intra_node_link_bw = intra_node.get("link_bw") if intra_node else None
+    intra_node_link_latency = intra_node.get("link_latency") if intra_node else None
 
     # Memory required keys
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
@@ -682,16 +721,29 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     )
 
     # Resolve DP groups across all instances.
-    _resolve_dp_groups(total_instances)
+    #
+    # TwoTierSwitch is a flat node-grouping topology, so the congestion-aware
+    # backend (1-D only) and the congestion-unaware backend with
+    # --analytical-topology TwoTierSwitch both collapse the resolved topology to
+    # a single dimension (stripping leading size-1 dims and their involved_dim
+    # entries), exactly as the CA backend does.
+    collapse_1d = (network_backend == 'analytical-ca') or (
+        network_backend == 'analytical' and analytical_topology == 'TwoTierSwitch')
+    topology_type = ca_topology if network_backend == 'analytical-ca' else analytical_topology
+    _resolve_dp_groups(total_instances, collapse_1d=collapse_1d)
 
     # Keep collective implementation arity aligned with the final global
     # ASTRA-Sim topology, while preserving the default ring implementation.
-    _sync_system_collective_dims(system_config_path, total_instances)
+    _sync_system_collective_dims(system_config_path, total_instances,
+                                 collapse_1d=collapse_1d)
 
     # Generate the final ASTRA-Sim input files after all instances are known.
     collective_links = cluster_config.get("collective_links")
     _create_network_config(network_config_path, total_instances, link_bw, link_latency,
-                           collective_links)
+                           collective_links, collapse_1d=collapse_1d,
+                           topology_type=topology_type, num_nodes=num_nodes,
+                           intra_node_link_bw=intra_node_link_bw,
+                           intra_node_link_latency=intra_node_link_latency)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
     _validate_memory_config(memory_config_path, placement, enable_local_offloading)
@@ -729,7 +781,9 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
 # generates topology according to the input arguments
 def _create_network_config(network_config_path, instances, link_bw, link_latency,
-                           collective_links=None):
+                           collective_links=None, collapse_1d=False, topology_type=None,
+                           ca_topology="Switch", num_nodes=None, intra_node_link_bw=None,
+                           intra_node_link_latency=None):
     """Create ASTRA-Sim network topology config.
 
     Topology dimensions:
@@ -737,14 +791,57 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
     """
-    dims = _compute_network_dims(instances)
+    dims = _compute_network_dims(instances, collapse_1d)
+    if collapse_1d and len(dims) != 1:
+        raise ValueError(
+            "This topology (congestion-aware analytical, or the congestion-unaware "
+            "TwoTierSwitch) supports a 1-D topology only, "
+            f"but this cluster resolves to {len(dims)} dimensions {dims}. "
+            "Collapse cannot be applied to multi-dimensional DP/PP group topologies."
+        )
+    # Collapsing leading size-1 dimensions must also drop the matching leading
+    # entries of a per-dimension bandwidth/latency list, or the list arity no
+    # longer matches the collapsed topology.
+    drop = _collapse_leading_ones(_compute_network_dims(instances)) if collapse_1d else 0
+
+    def _collapse_dim_values(raw_value, field_name):
+        if drop and isinstance(raw_value, list):
+            raw_value = raw_value[drop:]
+        return _normalize_network_dim_values(raw_value, len(dims), field_name)
+
     num_dims = len(dims)
+    if topology_type is None:
+        topology_type = ca_topology if collapse_1d else "FullyConnected"
     topology_data = {
-        "topology": FlowStyleList(["FullyConnected"] * num_dims),
+        "topology": FlowStyleList([topology_type] * num_dims),
         "npus_count": FlowStyleList(dims),
-        "bandwidth": _normalize_network_dim_values(link_bw, num_dims, "link_bw"),
-        "latency": _normalize_network_dim_values(link_latency, num_dims, "link_latency"),
+        "bandwidth": _collapse_dim_values(link_bw, "link_bw"),
+        "latency": _collapse_dim_values(link_latency, "link_latency"),
     }
+
+    # TwoTierSwitch adds a per-node NVLink tier on top of the fabric described
+    # by link_bw / link_latency. It needs the node count and intra-node links.
+    if topology_type == "TwoTierSwitch":
+        if not num_nodes or num_nodes < 1:
+            raise ValueError(
+                "TwoTierSwitch requires a cluster 'num_nodes' >= 1 "
+                f"(got {num_nodes!r})."
+            )
+        if dims[0] % num_nodes != 0:
+            raise ValueError(
+                "TwoTierSwitch requires the topology NPU count "
+                f"({dims[0]}) to be divisible by num_nodes ({num_nodes})."
+            )
+        if intra_node_link_bw is None or intra_node_link_latency is None:
+            raise ValueError(
+                "TwoTierSwitch requires an 'intra_node' cluster link "
+                "(link_bw / link_latency) describing the in-node NVLink tier."
+            )
+        topology_data["num_nodes"] = FlowStyleList([num_nodes] * num_dims)
+        topology_data["intra_node_bandwidth"] = (
+            _collapse_dim_values(intra_node_link_bw, "intra_node.link_bw"))
+        topology_data["intra_node_latency"] = (
+            _collapse_dim_values(intra_node_link_latency, "intra_node.link_latency"))
 
     # Validate every override before publishing any file. Only timing changes:
     # rank dimensions, topology and the bytes emitted by collectives stay fixed.
