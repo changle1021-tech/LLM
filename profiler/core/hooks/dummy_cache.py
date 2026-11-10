@@ -58,17 +58,23 @@ def _packed_attention_pages(layer, spec, num_blocks):
             raise ValueError('Packed indexer shuffle layout must be explicit')
     else:
         return None
+    tokens_per_state = getattr(spec, 'tokens_per_state', 1)
+    if (type(tokens_per_state) is not int or tokens_per_state < 1
+            or (tokens_per_state != 1 and kind != 'index_fp8_128')):
+        raise ValueError('Unsupported opaque cache pooling')
     cache = layer.kv_cache
     if (not isinstance(cache, torch.Tensor) or cache.dtype != torch.uint8
             or spec.dtype != torch.uint8 or cache.ndim != 3
             or type(num_blocks) is not int or num_blocks < 2
             or spec.num_kv_heads != 1 or spec.num_heads != 1
-            or spec.head_size_v != 0 or spec.tokens_per_state != 1
+            or spec.head_size_v != 0
             or spec.model_version is not None
             or cache.shape[0] < num_blocks or cache.shape[0] % num_blocks):
         raise ValueError('Unsupported opaque cache geometry')
     ratio = cache.shape[0] // num_blocks
-    if (spec.block_size % ratio or cache.shape[1] != spec.block_size // ratio
+    logical_block_span = ratio * tokens_per_state
+    if (spec.block_size % logical_block_span
+            or cache.shape[1] != spec.block_size // logical_block_span
             or cache.shape[2] != width or cache.stride(2) != 1
             or cache.stride(1) != width
             or cache.stride(0) < cache.shape[1] * width
@@ -76,6 +82,8 @@ def _packed_attention_pages(layer, spec, num_blocks):
             or (ratio > 1 and cache.stride(0) != cache.shape[1] * width)
             or (shuffled and cache.shape[1] % 16)):
         raise ValueError('Unsupported opaque cache strides/block subdivision')
+    if tokens_per_state > 1 and cache.shape[1] not in (32, 64):
+        raise ValueError('Pooled indexer cache requires native 32/64-state pages')
     return cache, kind, shuffled
 
 

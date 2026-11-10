@@ -23,6 +23,7 @@ and compare against the bundled architectures:
 | `qwen3`, `qwen3_moe` | `qwen3.yaml` | Qwen3, dense **and** MoE (0.6B … 32B, 30B-A3B, 235B-A22B), with per-head `qk_norm` |
 | `qwen3_5`, `qwen3_5_moe` (and their `_text` forms) | `qwen3_5.yaml` | Qwen3.5 / 3.6 / 3.8, dense **and** MoE — gated DeltaNet interleaved with full attention 3:1 |
 | `deepseek_v32`, `glm_moe_dsa` | `deepseek_v32.yaml` | DeepSeek-V3.2, GLM-5 — MLA plus a token-level sparse indexer (`index_topk`); the recorded vLLM 0.28 decomposition shares `deepseek_v2`, not a guarantee of later runtime compatibility |
+| `glm5_next`, `glm5_next_text` | `glm5_next.yaml` | GLM-5.3-Flash text path — separate wrapper/text config types; source-derived KDA/MLA, MLP, mHC and logical cache model, without a measured profile bundle |
 | `minimax_m3_vl` | `minimax_m3_vl.yaml` | MiniMax-M3 — block-level sparse attention (top-`k` blocks of `sparse_block_size` tokens) over GQA, non-sparse on the first few layers |
 | `kimi_k3` | `kimi_k3.yaml` | Kimi-K3's native `hybrid-residual` adapter: bounded eager TP/PP/DP/EP1 acquisition with BF16 activations and admitted native expert backends; see the [runtime contract](./output-bundle#native-kimi-acquisition). Skew, MTP and distributed acquisition are outside this contract |
 | `mixtral` | `mixtral.yaml` | `MixtralForCausalLM` (8x7B, 8x22B) |
@@ -40,6 +41,27 @@ each checkpoint; a family name alone does not establish identical shapes.
 If your `model_type` is one of these, start with the existing YAML, then check
 live profile coverage, cache layout and execution contracts. Catalog availability
 does not establish end-to-end accuracy for every checkpoint or configuration.
+
+GLM-5.3-Flash is not an alias of GLM-5. Its official config uses the
+`glm5_next` wrapper and `glm5_next_text` text type; the 45 text layers comprise
+34 KDA and 11 MLA layers, with 3 dense MLP layers and 42 MoE layers (288
+experts, top-8). The checkpoint is FP8-quantized, while KDA/MLA activations use
+BF16, as do their projection weights; mHC mixing parameters use FP32. The
+current simulator scope is text-only, including
+config-driven prefix/TP emulation, source-bound catalog entries, logical
+tensor/cache formulas, and the first/last mHC trace schedule. There is no
+acquired profile bundle or GPU coverage, so these source-derived additions do
+not provide measured latency or end-to-end accuracy validation. Vision timing
+and MTP, PP, and SP execution are not certified.
+
+Local NPU prefix reuse includes aligned KDA state checkpoints and private
+pooled-tail state; see [prefix caching](../simulator/scheduling/prefix-caching#glm-53-recurrent-state-checkpoints)
+for eligibility, memory accounting and storage/sharing limits.
+
+The shared stack resolver selects GLM's initial KDA or MLA block from the
+catalog, where the first operation is standalone `mhc_pre`. Later blocks use
+`mhc_fused_post_pre`; the attention kernel type and cache geometry stay unchanged.
+Trace generation and block reuse consume this resolved composition directly.
 
 If it's a *new* `model_type` (e.g., `gemma2`, `deepseek_v3`,
 `gpt_oss`), you need a new YAML. Read on.

@@ -48,6 +48,36 @@ pooled table: there was one, every lookup took it, and a sparse layer
 got the dense kernel's latency — 2.1x per layer on M3.
 :::
 
+## GLM-5.3-Flash is a separate text path
+
+GLM-5.3-Flash uses the `glm5_next` / `glm5_next_text` config types and a
+separate `glm5_next.yaml` catalog; the GLM-5 `glm_moe_dsa` alias does not cover
+it. Its text stack has 34 KDA and 11 MLA layers, three dense MLP layers and 42
+MoE layers, with 288 experts and top-8 routing. The checkpoint is FP8, while
+KDA/MLA activations and projection weights are BF16; mHC mixing parameters
+are FP32. The current model path includes text-side stack handling,
+profiler decoder prefixes and TP emulation, logical tensor/cache sizing, and a
+first/last mHC trace schedule.
+
+No GLM-5.3-Flash profile bundle or GPU coverage is available. The catalog and
+source-derived formulas do not establish measured latency accuracy. This scope
+is text-only; vision timing and MTP, PP, and SP execution are not certified.
+Local NPU prefix reuse requires matching KV and completed KDA checkpoints;
+CPU/CXL prefix storage, cross-instance sharing, P/D and attention offload remain
+unsupported. Logical
+cache payloads distinguish KDA state, replicated BF16 MLA latents, one
+132-byte index record per four tokens, and a BF16 tail ring. These formulas
+exclude native page padding and do not certify resident GPU capacity.
+
+Keep the original [checkpoint configuration](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/config.json)
+nested. The catalog follows [vLLM 0.31's GLM5Next implementation](https://github.com/vllm-project/vllm/tree/v0.31.0/vllm/models/glm5next);
+run the [coverage and bounded acquisition checks](../../profiler/adding-model-architecture.md#3-check-what-the-catalog-binds)
+on the intended GPU/backend before using a new bundle. A GLM simulation
+uses the acquired block size and matching profile tables. Prefix caching
+requires chunked prefill and a block size divisible by `index_kpool * 32`;
+see the [checkpoint lifecycle](../../simulator/scheduling/prefix-caching.md#glm-53-recurrent-state-checkpoints).
+No timings are borrowed from GLM-5.
+
 ## What the KV cache actually holds
 
 The capacity and deployment examples below describe the historical simulator

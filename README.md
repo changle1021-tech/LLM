@@ -16,7 +16,7 @@ A Unified Simulator for Heterogeneous and Disaggregated LLM Serving Infrastructu
 ## Latest News
 
 - **[In progress]** Porting the **entire simulator to Rust**, including an **in-house network backend** replacing ASTRA-Sim, for faster simulation, improved communication-model accuracy, and broader network topology support.
-- **[In progress]** Expanding **end-to-end validation** for existing model catalogs — DeepSeek, GLM, Kimi, MiniMax, Qwen3.8, and more.
+- **[In progress]** Expanding **end-to-end validation** for existing model catalogs — DeepSeek, GLM (including the text-only GLM-5.3-Flash path with local prefix reuse), Kimi, MiniMax, Qwen3.8, and more. No GLM-5.3-Flash profile bundle or accuracy result is published.
 - [2026/10] **vLLM 0.31.0 / CUDA 13 update** — **~7x faster end-to-end profiling**, Kimi-K3 model catalog, bug fixes, and improved Llama/Qwen accuracy with refreshed profiles and benchmarks. ([#77](https://github.com/casys-kaist/LLMServingSim/pull/77))
 - [2026/10] **vLLM 0.28.0 compatibility update** — added DeepSeek, GLM, MiniMax, and Qwen hybrid-model catalogs, fixed bugs, and improved simulation accuracy, validated against the RTXPRO6000 Llama and Qwen benchmark examples. ([#76](https://github.com/casys-kaist/LLMServingSim/pull/76))
 - [2026/08] Simulation is **~11x faster** with byte-identical results — the four `bench/examples` runs go 16m 40s → 1m 26s. ([#67](https://github.com/casys-kaist/LLMServingSim/pull/67))

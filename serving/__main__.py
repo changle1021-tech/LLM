@@ -269,14 +269,14 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
         dtype, kv_cache_dtype = _resolve_instance_dtypes(instance, dtype_to_bits)
         activation_bits = dtype_to_bits[dtype]
         model_config = get_config(instance['model_name'])
-        if model_config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text'):
-            # The checkpoint variant selects weight measurements (FP8 dense,
-            # MXFP4 experts). Residuals and the MoE input retain the
-            # checkpoint activation dtype.
+        if model_config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text',
+                                             'glm5_next', 'glm5_next_text'):
+            # The checkpoint variant selects quantized weight measurements.
+            # Residuals and the MoE input retain the checkpoint activation dtype.
             activation = model_config.get('torch_dtype') or model_config.get('dtype')
             activation_width = dtype_bytes(activation, None)
             if activation_width != 2:
-                raise NotImplementedError('V4.1 requires a declared 16-bit activation layout')
+                raise NotImplementedError('The native model requires a declared 16-bit activation layout')
             activation_bits = activation_width * 8
 
         enable_attn_offloading = instance.get("enable_attn_offloading", args.enable_attn_offloading)

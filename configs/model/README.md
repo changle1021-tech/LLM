@@ -60,6 +60,7 @@ additional normalization, routing or layout fields that ordinary sizing ignores.
 | `Qwen/Qwen3.8-27B.json` | dense, **hybrid** | 64 | 5120 | 24 | 4 | — |
 | `deepseek-ai/DeepSeek-V3.2-Exp.json` | MoE, **MLA + sparse** | 61 | 7168 | 128 | 128 | 256E / top-8 |
 | `zai-org/GLM-5.json` | MoE, **MLA + sparse** | 78 | 6144 | 64 | 64 | 256E / top-8 |
+| `zai-org/GLM-5.3-Flash.json` | text MoE, **KDA + MLA + mHC** | 45 | 4096 | 64 | KDA state + MLA latent | 288E / top-8 |
 | `MiniMaxAI/MiniMax-M3.json` | MoE, **block-sparse** | 60 | 6144 | 64 | 4 | 128E / top-4 |
 | `moonshotai/Kimi-K3.json` | MoE, **KDA + MLA + AttnRes** | 93 | 7168 | 96 | MLA latent | 896E / top-16 |
 
@@ -71,6 +72,7 @@ The hybrid and sparse configurations are not uniform stacks, which is the point 
 | `Qwen3.8-27B` | 48 gated-DeltaNet + 16 full attention | 1 MTP module |
 | `DeepSeek-V3.2-Exp` | 3 dense MLP + 58 MoE, sparse attention on all 61 | 1 MTP module |
 | `GLM-5` | 3 dense MLP + 75 MoE, sparse attention on all 78 | 1 MTP module |
+| `GLM-5.3-Flash` | 34 KDA + 11 MLA; 3 dense MLP + 42 MoE; 288 experts / top-8; four-stream mHC | not certified |
 | `MiniMax-M3` | 3 dense MLP + 57 MoE, sparse attention on 57 | 7 MTP modules |
 | `Kimi-K3` | 69 KDA + 24 MLA; 1 dense MLP + 92 MoE | not admitted by this profiler path |
 
@@ -78,6 +80,20 @@ DeepSeek-V3.2 and GLM-5 may expose `deepseek_sparse_attention` in native
 `layer_types`. Stack resolution treats it as a cache-dispatch label, mapping it
 to the catalog's full-attention block axis while retaining sparse indexing on
 its separate axis. The stored config and native execution remain unchanged.
+
+GLM-5.3-Flash is a separate text architecture, not another `glm_moe_dsa`
+checkpoint. Its wrapper/text config types are `glm5_next` / `glm5_next_text`.
+Weights are FP8-quantized; KDA/MLA activations and projection weights are
+BF16, and mHC mixing parameters are FP32. The
+current additions cover text config/stack handling, TP shape emulation, logical
+tensor/cache sizing, and the first/last mHC trace schedule. There is no GPU
+coverage or acquired profile bundle, so no measured accuracy is claimed. Vision
+timing and MTP, PP, and SP execution are not certified.
+
+Local NPU prefix reuse requires chunked prefill and a block size divisible by
+`index_kpool * 32`. Completed KDA checkpoints and token KV must match at the
+same boundary; private working state includes the pooled indexer's tail ring.
+CPU/CXL prefix storage and cross-instance prefix sharing are not supported.
 
 Kimi-K3 stays nested with its original one-based attention schedule and
 `num_experts_per_token` alias. Shared stack helpers resolve expert top-k without

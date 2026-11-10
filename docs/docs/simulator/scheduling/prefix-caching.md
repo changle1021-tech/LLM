@@ -186,6 +186,42 @@ consequence to expect: a storage hit only ever extends the prefix in
 whole 256-token steps, so a request with a 200-token prompt can never
 hit the storage tier at all.
 
+## GLM-5.3 recurrent-state checkpoints
+
+GLM-5.3-Flash supports local NPU prefix reuse with chunked prefill. A hit
+requires both contiguous MLA/indexer KV blocks and a complete KDA checkpoint
+at the same token position. The checkpoint contains every KDA layer's
+convolution and recurrent state; KV alone does not establish a reusable
+prefix. Lookup backs off to the latest resident checkpoint within the KV hit.
+
+Checkpoints are published only at an actually completed, block-aligned chunk
+end. A forward spanning several blocks does not create snapshots at the
+intermediate boundaries, and a partial chunk does not create a snapshot at
+its rounded-down end. At least one token still executes to produce logits.
+
+Each request reserves private working state plus separate immutable checkpoint
+slots. A resumed request restores from a resident checkpoint into its private
+working state, so subsequent execution does not overwrite another request's
+snapshot. When the request reaches a new aligned boundary, the old checkpoint
+becomes evictable and a new one is published after completion. Completion and
+preemption release all request-owned slots; indexed checkpoints remain
+reusable until the NPU pool evicts them. Losing any block of a checkpoint
+invalidates the entire snapshot.
+
+The configured block size must be a multiple of `index_kpool * 32`. Such a
+boundary ends a complete index pool, so no incomplete pooled tail must be
+restored. Each request has its own tail ring, included in working-state
+capacity, and recomputes tokens after the hit boundary.
+
+Working state and checkpoints consume the same NPU memory budget as KV.
+Their aggregate per-rank logical payloads are rounded separately to the pool's
+block unit. This models capacity and reuse eligibility; it does not reproduce
+native allocator padding or independently measure checkpoint-copy latency.
+CPU/CXL prefix storage and cross-instance prefix sharing remain unsupported
+for this layout. Source-derived support does not establish measured GLM-5.3
+latency or end-to-end accuracy without an acquired profile bundle and a
+matching benchmark.
+
 ## What gets reported
 
 Every iteration's `add_done` call updates these counters:

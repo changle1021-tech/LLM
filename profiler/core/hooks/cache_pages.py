@@ -31,6 +31,11 @@ def allocate_shot_blocks(shot, runner):
     from vllm.v1.kv_cache_interface import (
         CircularBufferSpec, MambaSpec, UniformTypeKVCacheSpecs,
     )
+    from vllm.v1 import kv_cache_interface
+    fixed_specs = (CircularBufferSpec,)
+    tail_spec = getattr(kv_cache_interface, 'KpoolTailSpec', None)
+    if tail_spec is not None:
+        fixed_specs += (tail_spec,)
     cache = runner.kv_cache_config
     counts = []
     for group in cache.kv_cache_groups:
@@ -61,7 +66,7 @@ def allocate_shot_blocks(shot, runner):
                         # align needs sparse/null historical entries and checkpoint
                         # placement. Prefix-disabled profiler boots use none.
                         raise ValueError(f'Unsupported synthetic Mamba state cache mode: {mode}')
-                elif isinstance(spec, CircularBufferSpec):
+                elif isinstance(spec, fixed_specs):
                     # A ring is resident for the request lifetime; its block
                     # size is capacity, not a sequence-position page span.
                     count = spec.max_num_blocks_per_req(

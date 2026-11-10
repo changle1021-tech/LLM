@@ -367,15 +367,16 @@ def spec_block_site(architecture, spec, part):
         raise ValueError(f"Unknown decoder part: {part}")
     axis = "attn"
     group = None
+    attn = spec.attn_block or spec.attn
     if spec.sparse:
-        group = (blocks.get("sparse_attn") or {}).get(spec.attn)
+        group = (blocks.get("sparse_attn") or {}).get(attn)
         if group is not None:
             axis = "sparse_attn"
     if group is None:
-        group = (blocks.get("attn") or {}).get(spec.attn)
+        group = (blocks.get("attn") or {}).get(attn)
     if group is None:
-        raise ValueError(f"Architecture has no blocks.attn.{spec.attn}")
-    return ("blocks", axis, spec.attn, part)
+        raise ValueError(f"Architecture has no blocks.attn.{attn}")
+    return ("blocks", axis, attn, part)
 
 
 def resolved_text_config(vllm_config):

@@ -9,6 +9,8 @@ from .block_pool import Device, BlockPool, PrefixCacheStats
 from .kv_cache_manager import TieredKVCacheManager, request_block_hashes
 from .communication import engram_tp_geometry, sequence_parallel_rows
 from .deepseek_v41_geometry import BOUNDARIES as V41_BOUNDARIES, logical_sizes as v41_logical_sizes
+from .glm5_next_geometry import (MODEL_TYPES as GLM5_NEXT_TYPES,
+    logical_sizes as glm5_next_sizes, cache_bytes as glm5_next_cache_bytes)
 from .logger import get_logger
 
 GB_TO_BYTE = 1024 * 1024 * 1024
@@ -204,6 +206,13 @@ class MemoryModel():
             raise ValueError('Native page pool does not match the local-only serving layout')
 
         self.config = get_config(model)
+        if self.config.get('model_type') in GLM5_NEXT_TYPES:
+            if (pp_size != 1 or self.num_speculative_tokens
+                    or enable_prefix_sharing or prefix_storage is not None):
+                raise NotImplementedError('GLM-5.3 cache sizing requires PP1 without MTP or prefix storage/sharing')
+            pool_width = self.config['index_kpool']
+            if type(block_size) is not int or block_size < 1 or block_size % (pool_width * 32):
+                raise ValueError('GLM-5.3 cache blocks must be a multiple of index_kpool * 32')
         self.kv_fp = kv_element_bytes(self.config, self.fp, kv_cache_dtype)  # KV cache bytes per element
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
@@ -232,6 +241,8 @@ class MemoryModel():
         self._bytes_per_token = self.get_kv(1)              # per rank
         self._npu_bytes_per_block = (native_page_pool.logical_block_bytes if native_page_pool
                                      else self._bytes_per_token * block_size)
+        if self.config.get('model_type') in GLM5_NEXT_TYPES:
+            self._npu_bytes_per_block = self.get_kv(block_size)
         self._cluster_bytes_per_token = self._bytes_per_token * self.num_npus
 
         # vLLM: requested = total_gpu_memory * gpu_memory_utilization, then
@@ -287,7 +298,24 @@ class MemoryModel():
             block_size, self.npu_pool, self.lower_pools,
             enable_caching=enable_prefix_caching,
             state_blocks_per_request=self._state_blocks_per_request(),
+            state_checkpoint_blocks=self._state_checkpoint_blocks(),
         )
+
+    def _state_checkpoint_blocks(self):
+        """Immutable KDA boundary snapshot, separate from private working state.
+
+        GLM's pool-aligned hit has no incomplete index pool to restore. Its
+        tail ring stays private and is already in _state_blocks_per_request.
+        Round the aggregate per-rank KDA snapshot up to the pool's block unit,
+        just as for working state; this is logical capacity, not native padding.
+        """
+        if not self.enable_prefix_caching or self.config.get('model_type') not in GLM5_NEXT_TYPES:
+            return 0
+        fixed = sum(glm5_next_cache_bytes(self.config, 0, self.tp_size,
+                    linear=True)[1]
+                    for spec in get_layer_stack(self.model)
+                    if spec.attn == 'linear_attention')
+        return (fixed + self._npu_bytes_per_block - 1) // self._npu_bytes_per_block
 
     def _state_blocks_per_request(self):
         """Pool blocks one request holds for its per-sequence layer state.
@@ -327,6 +355,10 @@ class MemoryModel():
         prefix-caching run by exactly 2x.
         """
         stack = get_layer_stack(self.model)
+        if self.config.get('model_type') in GLM5_NEXT_TYPES:
+            fixed = sum(glm5_next_cache_bytes(self.config, 0, self.tp_size,
+                linear=spec.attn == 'linear_attention')[1] for spec in stack)
+            return (fixed + self._npu_bytes_per_block - 1) // self._npu_bytes_per_block
         if not stack:
             return 0
         mamba_layers = sum(
@@ -453,17 +485,16 @@ class MemoryModel():
     @staticmethod
     def _block_layer_names(arch, spec):
         """Every canonical layer one decoder layer of shape ``spec`` emits."""
+        from profiler.core.component_layouts import spec_block_site
         blocks = arch.get("blocks") or {}
-        group = None
-        if spec.sparse:
-            group = (blocks.get("sparse_attn") or {}).get(spec.attn)
-        if group is None:
-            group = (blocks.get("attn") or {}).get(spec.attn)
-        if group is None:
+        try:
+            path = spec_block_site(arch, spec, "pre_attn")
+        except ValueError as exc:
             raise KeyError(
                 f"Architecture for {arch.get('model_types') or 'this model'} "
-                f"declares no 'blocks.attn.{spec.attn}'."
-            )
+                f"declares no 'blocks.attn.{spec.attn_block or spec.attn}'."
+            ) from exc
+        group = blocks[path[1]][path[2]]
         return (list(group.get("pre_attn") or [])
                 + list(group.get("post_attn") or [])
                 + list((blocks.get("mlp") or {}).get(spec.mlp) or []))
@@ -474,6 +505,8 @@ class MemoryModel():
         ``moe`` shards by EP, everything else by TP — the same split
         ``calculate_sizes`` documents.
         """
+        if self.config.get('model_type') in GLM5_NEXT_TYPES:
+            return glm5_next_sizes(self.config, name, 1, self.tp_size, ep=self.ep_size)[1]
         parallel = self.ep_size if name == "moe" else self.tp_size
         _, weight, _ = calculate_sizes(
             self.model, name, 1, kv_len=1, parallel=parallel, fp=self.fp,
@@ -496,6 +529,10 @@ class MemoryModel():
         """
         if getattr(self, 'native_page_pool', None) is not None:
             return self.native_page_pool.kv_bytes(seq)
+        if self.config.get('model_type') in GLM5_NEXT_TYPES:
+            return sum(glm5_next_cache_bytes(self.config, seq, self.tp_size,
+                linear=spec.attn == 'linear_attention')[0]
+                for spec in get_layer_stack(self.model))
         if self._kv_bytes_per_token_per_rank is None:
             config, kv_fp = self.config, self.kv_fp
             stack = get_layer_stack(self.model) or [None] * self.n_layer
@@ -767,6 +804,13 @@ def kv_bytes_per_token_per_layer(config, kv_fp, spec=None):
     ``spec`` is the layer's :class:`LayerSpec`; ``None`` answers for a uniform
     stack.
     """
+    if config.get('model_type') in GLM5_NEXT_TYPES:
+        if spec is not None and spec.attn == 'linear_attention':
+            return 0, 0
+        # Average within a complete native pool; get_kv(seq) retains the
+        # exact per-request ceiling instead of multiplying a one-token tail.
+        pool = config['index_kpool']
+        return 0, glm5_next_cache_bytes(config, pool)[0] // pool
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     head_dim = config.get('head_dim', n_embd // n_head)
@@ -903,6 +947,11 @@ def state_bytes_per_sequence(config, fp, spec=None, num_spec_tokens=0):
 
     Returns 0 for any layer that is not linear attention.
     """
+    if config.get('model_type') in GLM5_NEXT_TYPES:
+        if spec is None:
+            raise ValueError('GLM-5.3 state sizing requires the layer attention type')
+        return glm5_next_cache_bytes(config, 0,
+            linear=spec.attn == 'linear_attention', num_spec_tokens=num_spec_tokens)[1]
     if spec is not None and spec.attn != 'linear_attention':
         return 0
     k_heads = config.get('linear_num_key_heads') or 0
@@ -950,6 +999,10 @@ def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     decide it. Unquantized checkpoints are unchanged either way, since their
     weight and activation dtypes agree.
     """
+    if config.get('model_type') in GLM5_NEXT_TYPES:
+        if kv_cache_dtype not in ('auto', 'bfloat16', 'bf16'):
+            raise NotImplementedError('GLM-5.3 cache geometry currently covers the BF16 MLA layout')
+        return 2
     if kv_cache_dtype == 'fp8':
         return 1
     quant = config.get('quantization_config')
@@ -993,6 +1046,12 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             raise ValueError("Logical component boundaries do not accept inferred cache traffic")
         return component_sizes.sizes(layer_name, length, parallel=parallel, pim=pim)
     config = get_config(model)
+    if config.get('model_type') in GLM5_NEXT_TYPES:
+        if pim or kv_len is not None or kv_lens is not None or sequence_parallel:
+            raise NotImplementedError('GLM-5.3 logical boundaries do not infer cache traffic or SP layout')
+        return glm5_next_sizes(config, layer_name, length,
+            tp=1 if layer_name == 'moe' else parallel,
+            ep=parallel if layer_name == 'moe' else 1, layer_index=layer_index)
     if (config.get('model_type') in ('deepseek_v41', 'deepseek_v41_text')
             and layer_name in V41_BOUNDARIES):
         if pim or kv_len is not None or kv_lens is not None:

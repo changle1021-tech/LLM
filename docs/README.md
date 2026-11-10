@@ -20,6 +20,10 @@ docs/
 
 ## Contribution policy
 
+The [prefix-cache guide](docs/simulator/scheduling/prefix-caching.md#glm-53-recurrent-state-checkpoints)
+documents GLM-5.3's local KDA checkpoint lifecycle and logical memory scope;
+keep the model guide's supported combinations consistent with it.
+
 Follow the repository [commit policy](docs/contributor/pr-workflow.md#commit-hygiene)
 and [AGENTS.md](../AGENTS.md). Every commit includes updates to the root and
 affected directory READMEs, AGENTS.md, CHANGELOG.md, and relevant public docs.
@@ -79,6 +83,9 @@ Qwen3-30B TP1/DP2/EP2 with refreshed vLLM 0.31.0 data. Acquiring another TP
 or adding a catalog does not extend those accuracy claims. Kimi's local
 duration replay and native DeepSeek's duration-only representation remain
 distinct from ordinary scheduler/capacity admission; the guides state the limits.
+GLM-5.3-Flash has source-derived text-only simulator support, but no acquired
+profile bundle, GPU coverage or measured accuracy claim; see the model-config
+and sparse-attention guides for its scope and unsupported modes.
 
 ## Installation
 

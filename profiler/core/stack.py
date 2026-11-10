@@ -44,6 +44,7 @@ MLP_MOE = "moe"
 # Duplicated deliberately rather than imported: config.py pulls in pydantic,
 # and this module stays importable from the simulator container.
 _EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
+_GLM5_NEXT_TYPES = ("glm5_next", "glm5_next_text")
 
 
 def materialize_prefix(config, overrides):
@@ -56,7 +57,8 @@ def materialize_prefix(config, overrides):
     from this returned config, so native config loading cannot undo clipping.
     """
     kimi = config.get("model_type") in ("kimi_k3", "kimi_linear")
-    if kimi and "text_config" in overrides:
+    glm = config.get("model_type") in _GLM5_NEXT_TYPES
+    if (kimi or glm) and "text_config" in overrides:
         raise ValueError("Backbone overrides must be explicit top-level fields")
     result = copy.deepcopy(config)
     inner = result.get("text_config", result)
@@ -76,6 +78,8 @@ def materialize_prefix(config, overrides):
         source_depth = depth
     if kimi and depth > source_depth:
         raise ValueError("Kimi prefix must be within the original decoder depth")
+    if glm and depth > source_depth:
+        raise ValueError("GLM5Next prefix must be within the original decoder depth")
     # Keep the whole effective source schedule visible before clipping it.
     # Uniform non-Kimi configs retain their previous ability to change depth;
     # an indexed schedule must cover both the source and requested depths.
@@ -89,6 +93,16 @@ def materialize_prefix(config, overrides):
                 index for index in inner["linear_attn_config"][name] if index <= depth]
     if isinstance(inner.get("layer_types"), list):
         inner["layer_types"] = inner["layer_types"][:depth]
+    if glm:
+        for name in ("mlp_layer_types", "indexer_types"):
+            if isinstance(inner.get(name), list):
+                inner[name] = inner[name][:depth]
+        if isinstance(inner.get("linear_attn_config"), dict):
+            for name in ("kda_layers", "full_attn_layers"):
+                if name in inner["linear_attn_config"]:
+                    inner["linear_attn_config"][name] = [
+                        index for index in inner["linear_attn_config"][name]
+                        if index < depth]
     return result
 
 
@@ -135,11 +149,14 @@ class LayerSpec:
     ``sparse`` is whether this layer runs a sparse-attention selection branch
     on top of its attention kernel. It is a third axis rather than part of
     ``attn`` because vendors vary it independently of the attention type.
+    ``attn_block`` optionally selects a source-derived execution block while
+    retaining ``attn`` for kernel geometry and profiling-axis coverage.
     """
 
     attn: str
     mlp: str
     sparse: bool = False
+    attn_block: str | None = None
 
 
 def text_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -335,6 +352,65 @@ def _deepseek_v41_attn_types(cfg: dict[str, Any], n: int) -> list[str]:
     return expected[:n]
 
 
+def _glm5_next_attn_types(cfg: dict[str, Any], n: int) -> list[str]:
+    """Resolve GLM-5.3's zero-based KDA/MLA schedule without losing checks.
+
+    vLLM 0.31 glm5next/common/model.py constructs KDA only when
+    Glm5NextTextConfig.is_kda_layer selects ``linear_attention``. The other
+    admitted native label is sparse MLA; its indexer remains a separate axis.
+    Legacy linear_attn_config layer IDs must agree with the active schedule.
+    """
+    depth = cfg.get("num_hidden_layers")
+    if type(depth) is not int or depth < 1:
+        raise ValueError("GLM5Next num_hidden_layers must be a positive integer")
+    declared = cfg.get("layer_types")
+    allowed = ("linear_attention", "deepseek_sparse_attention")
+    if (not isinstance(declared, list) or len(declared) < depth
+            or any(type(value) is not str or value not in allowed for value in declared)):
+        raise ValueError("GLM5Next layer_types must cover the decoder with native KDA/MLA labels")
+    linear = cfg.get("linear_attn_config")
+    if linear is not None:
+        if not isinstance(linear, dict):
+            raise ValueError("GLM5Next linear_attn_config must be a mapping")
+        for name, kind in (("kda_layers", "linear_attention"),
+                           ("full_attn_layers", "deepseek_sparse_attention")):
+            if name not in linear:
+                continue
+            ids = linear[name]
+            if (not isinstance(ids, list)
+                    or any(type(index) is not int or not 0 <= index < depth for index in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError(f"GLM5Next {name} must contain unique zero-based decoder IDs")
+            if set(ids) != {i for i, value in enumerate(declared[:depth]) if value == kind}:
+                raise ValueError(f"GLM5Next {name} contradicts layer_types")
+    indexers = cfg.get("indexer_types")
+    if indexers is not None and (not isinstance(indexers, list) or len(indexers) < depth
+            or any(type(value) is not str or value != "full" for value in indexers)):
+        raise ValueError("GLM5Next supports only a full native indexer_types schedule")
+    return ["linear_attention" if value == "linear_attention" else FULL_ATTENTION
+            for value in declared[:n]]
+
+
+def _glm5_next_mlp_types(cfg: dict[str, Any], n: int) -> list[str]:
+    """Native mlp_layer_types takes precedence over the legacy dense prefix.
+
+    Glm5NextTextConfig synthesizes this list from first_k_dense_replace only
+    when it is absent. The decoder indexes it directly, without moe_layer_freq.
+    """
+    declared = cfg.get("mlp_layer_types")
+    if declared is None:
+        first = cfg.get("first_k_dense_replace", 0)
+        if type(first) is not int or not 0 <= first <= n:
+            raise ValueError("GLM5Next first_k_dense_replace must be within decoder depth")
+        declared = ["dense"] * first + ["sparse"] * (n - first)
+    if (not isinstance(declared, list) or len(declared) < n
+            or any(type(value) is not str or value not in ("dense", "sparse")
+                   for value in declared)):
+        raise ValueError("GLM5Next mlp_layer_types must cover the decoder with dense/sparse labels")
+    return [MLP_MOE if value == "sparse" and _experts(cfg) > 0 else MLP_DENSE
+            for value in declared[:n]]
+
+
 def _attn_types(cfg: dict[str, Any], n: int) -> list[str]:
     """Attention type per layer.
 
@@ -350,6 +426,8 @@ def _attn_types(cfg: dict[str, Any], n: int) -> list[str]:
         return _kimi_attn_types(cfg, n)
     if cfg.get("model_type") in ("deepseek_v41", "deepseek_v41_text"):
         return _deepseek_v41_attn_types(cfg, n)
+    if cfg.get("model_type") in _GLM5_NEXT_TYPES:
+        return _glm5_next_attn_types(cfg, n)
     declared = cfg.get("layer_types")
     if isinstance(declared, list):
         # A config may declare more entries than the (possibly shrunk) layer
@@ -392,6 +470,8 @@ def _mlp_types(cfg: dict[str, Any], n: int) -> list[str]:
     ``minimax_m3/nvidia/model.py:109-114`` indexes the declared layer directly
     and compares it with zero. It does not repeat a shorter schedule.
     """
+    if cfg.get("model_type") in _GLM5_NEXT_TYPES:
+        return _glm5_next_mlp_types(cfg, n)
     experts = _experts(cfg)
     if experts <= 0:
         return [MLP_DENSE] * n
@@ -438,6 +518,12 @@ def _sparse_flags(cfg: dict[str, Any], n: int) -> list[bool]:
       != 0``. ``index_topk_freq`` defaults to 1, under which that is never
       true, so a config declaring neither field is sparse on every layer.
     """
+    if cfg.get("model_type") in _GLM5_NEXT_TYPES:
+        topk = cfg.get("index_topk")
+        if topk is not None and (type(topk) is not int or topk < 1):
+            raise ValueError("GLM5Next index_topk must be a positive integer or null")
+        return [topk is not None and value == "deepseek_sparse_attention"
+                for value in cfg["layer_types"][:n]]
     sac = cfg.get("sparse_attention_config")
     if isinstance(sac, dict):
         freq = sac.get("sparse_attention_freq")
@@ -490,6 +576,9 @@ def resolve_stack(cfg: dict[str, Any], *, prefix_layers: int | None = None) -> l
     if cfg.get("model_type") in ("kimi_k3", "kimi_linear"):
         if type(cfg.get("num_hidden_layers")) is not int or n < 1:
             raise ValueError("Kimi num_hidden_layers must be a positive integer")
+    if cfg.get("model_type") in _GLM5_NEXT_TYPES:
+        if type(cfg.get("num_hidden_layers")) is not int or n < 1:
+            raise ValueError("GLM5Next num_hidden_layers must be a positive integer")
     if prefix_layers is not None:
         if type(prefix_layers) is not int or not 1 <= prefix_layers <= n:
             raise ValueError("prefix_layers must be within the original depth")
@@ -500,10 +589,15 @@ def resolve_stack(cfg: dict[str, Any], *, prefix_layers: int | None = None) -> l
     attn = _attn_types(cfg, n)
     mlp = _mlp_types(cfg, n)
     sparse = _sparse_flags(cfg, n)
+    # The first mHC attention has no deferred post from a preceding decoder.
+    # Select its standalone-pre block without changing KDA/MLA geometry.
+    initial_mhc = (cfg.get("model_type") in _GLM5_NEXT_TYPES
+                   and cfg.get("mhc", True))
     if prefix_layers is not None:
         n = prefix_layers
     return [
-        LayerSpec(attn=attn[i], mlp=mlp[i], sparse=sparse[i])
+        LayerSpec(attn=attn[i], mlp=mlp[i], sparse=sparse[i],
+                  attn_block=f"{attn[i]}_initial" if initial_mhc and i == 0 else None)
         for i in range(n)
     ]
 
@@ -548,6 +642,21 @@ def minimal_layer_count_for(
     if not stack:
         return 1
 
+    glm_mhc = (cfg.get("model_type") in _GLM5_NEXT_TYPES
+               and text_config(cfg).get("mhc", True))
+    minimum = min(2, len(stack)) if glm_mhc else 1
+    if cfg.get("model_type") in _GLM5_NEXT_TYPES:
+        # GLM declares independent attention and MLP block lists. Capturing
+        # each axis value is sufficient; a KDA/MoE combination adds no new
+        # canonical owner once KDA, MLA, dense and MoE have all appeared.
+        wanted_axes = {(axis, getattr(spec, axis)) for spec in stack for axis in axes}
+        seen_axes = set()
+        for i, spec in enumerate(stack):
+            seen_axes.update((axis, getattr(spec, axis)) for axis in axes)
+            if seen_axes == wanted_axes and i + 1 >= minimum:
+                return i + 1
+        return len(stack)
+
     def key(spec: "LayerSpec") -> tuple:
         return tuple(getattr(spec, a) for a in axes)
 
@@ -583,14 +692,14 @@ def describe(cfg: dict[str, Any]) -> str:
         only = stack[0]
         return (
             f"layer stack: uniform, {len(stack)} x "
-            f"({only.attn}, {only.mlp} mlp"
+            f"({only.attn_block or only.attn}, {only.mlp} mlp"
             f"{', sparse' if only.sparse else ''}) -> profiling {n} layer"
         )
     counts: dict[LayerSpec, int] = {}
     for spec in stack:
         counts[spec] = counts.get(spec, 0) + 1
     shapes = ", ".join(
-        f"{c}x({s.attn}, {s.mlp}{', sparse' if s.sparse else ''})"
+        f"{c}x({s.attn_block or s.attn}, {s.mlp}{', sparse' if s.sparse else ''})"
         for s, c in sorted(counts.items(), key=lambda kv: -kv[1])
     )
     return (

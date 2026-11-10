@@ -74,6 +74,7 @@ profiler/                          Python package: python -m profiler
 │   ├── qwen3.yaml                 Qwen3 dense and MoE
 │   ├── qwen3_5.yaml               Qwen3.5-family hybrid attention
 │   ├── deepseek_v32.yaml          DeepSeek-V3.2 and GLM-5
+│   ├── glm5_next.yaml             GLM-5.3-Flash text path
 │   ├── minimax_m3_vl.yaml         MiniMax-M3
 │   ├── mixtral.yaml
 │   └── phimoe.yaml
@@ -88,6 +89,19 @@ The simulator also imports the shared stack, catalog, attention, skew and MoE
 contracts; these paths must remain usable without vLLM or GPU dependencies.
 Changes to those helpers can affect simulator results. Environment launchers
 and build entry points live separately under [scripts/](../scripts/README.md).
+
+GLM-5.3-Flash is a separate `glm5_next` / `glm5_next_text` catalog path; it
+does not inherit GLM-5's `deepseek_v32.yaml` bindings. Its text stack and
+logical tensor/cache formulas are represented, but there is no acquired
+performance bundle or GPU coverage yet. Run live coverage and profiling on the
+target vLLM runtime before relying on latency data. Vision timing and MTP,
+pipeline-parallel, and sequence-parallel execution are outside the documented
+scope.
+
+Its source-derived initial mHC blocks are resolved in the shared stack without
+changing the KDA/MLA kernel type. Simulator-side local prefix reuse additionally
+tracks aligned KDA checkpoints; this cache support does not certify profiling
+coverage or checkpoint-copy latency.
 
 ## Everything you can set
 

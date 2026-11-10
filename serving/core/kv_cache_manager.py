@@ -83,10 +83,13 @@ class TieredKVCacheManager:
             plain vLLM: there is no host KV tier, so a preempted request
             recovers only what is still resident and recomputes the rest.
         enable_caching: mirrors ``--enable-prefix-caching``.
+        state_checkpoint_blocks: extra NPU blocks reserved per request for an
+            immutable recurrent-state checkpoint at an executed block boundary.
+            A hit must have both contiguous token KV and the whole checkpoint.
     """
 
     def __init__(self, block_size, npu_pool, lower_pools=(), enable_caching=True,
-                 state_blocks_per_request=0):
+                 state_blocks_per_request=0, state_checkpoint_blocks=0):
         self.block_size = block_size
         # Blocks a request holds for its whole life regardless of length, for
         # a model whose layers keep a fixed per-sequence state instead of a
@@ -104,6 +107,14 @@ class TieredKVCacheManager:
         self.npu_pool = npu_pool
         self.lower_pools = list(lower_pools)
         self.enable_caching = enable_caching and npu_pool.enable_caching
+        # Optional aligned recurrent-state snapshots share the NPU capacity,
+        # but use a separate hash namespace from the token KV blocks. Working
+        # state stays private; cached snapshots are immutable and evictable.
+        self.state_checkpoint_blocks = int(state_checkpoint_blocks)
+        if self.state_checkpoint_blocks < 0:
+            raise ValueError('State checkpoint block count must be nonnegative')
+        if self.state_checkpoint_blocks and (not self.enable_caching or self.lower_pools):
+            raise ValueError('State checkpoints require local NPU prefix caching')
 
         for pool in self.lower_pools:
             if pool.block_size % block_size != 0:
@@ -118,6 +129,7 @@ class TieredKVCacheManager:
         self.req_to_blocks = {}
         # request id -> its per-sequence state blocks, positionless
         self.req_to_state_blocks = {}
+        self.req_to_checkpoint_blocks = {}
         # request id -> how many of those blocks are already indexed
         self.num_cached_block = {}
 
@@ -140,6 +152,15 @@ class TieredKVCacheManager:
         return hashes[fine_idx]
 
     # -------------------- lookup --------------------
+
+    def _checkpoint_hashes(self, prefix_hash):
+        return [('prefix_state', prefix_hash, i)
+                for i in range(self.state_checkpoint_blocks)]
+
+    def _get_checkpoint(self, prefix_hash):
+        blocks = [self.npu_pool.get_cached_block(key)
+                  for key in self._checkpoint_hashes(prefix_hash)]
+        return blocks if all(block is not None for block in blocks) else []
 
     def get_computed_blocks(self, req):
         """Longest recoverable prefix for ``req``, split by tier.
@@ -170,6 +191,11 @@ class TieredKVCacheManager:
                 # is uncomputed or gone. Stop.
                 break
             npu_blocks.append(block)
+        if self.state_checkpoint_blocks:
+            # KV may cover many boundaries for which no recurrent state was
+            # exported. Find the latest *complete* snapshot within that hit.
+            while npu_blocks and not self._get_checkpoint(hashes[len(npu_blocks) - 1]):
+                npu_blocks.pop()
         num_npu_hit = len(npu_blocks) * self.block_size
 
         num_lower_hit = self._lookup_lower(req, hashes, num_npu_hit)
@@ -225,6 +251,8 @@ class TieredKVCacheManager:
             self.state_blocks_per_request
             if req.id not in self.req_to_state_blocks else 0
         )
+        if req.id not in self.req_to_checkpoint_blocks:
+            state_needed += self.state_checkpoint_blocks
         if req.id in self.num_cached_block:
             # Fast path: a running request has no new prefix hits to account for.
             return max(num_required_blocks - len(req_blocks), 0) + state_needed
@@ -290,6 +318,16 @@ class TieredKVCacheManager:
         ) > self.npu_pool.get_num_free_blocks():
             return None
 
+        checkpoint = []
+        if self.state_checkpoint_blocks and num_new_computed_tokens:
+            if (num_lower_tier_tokens or num_new_computed_tokens % self.block_size
+                    or len(new_computed_blocks) * self.block_size != num_new_computed_tokens):
+                raise ValueError('State restore requires an aligned local KV hit')
+            hashes = request_block_hashes(req, self.block_size)
+            checkpoint = self._get_checkpoint(hashes[num_new_computed_tokens // self.block_size - 1])
+            if not checkpoint:
+                raise ValueError('KV prefix hit has no complete recurrent-state checkpoint')
+
         # ---- past this point the allocation is guaranteed to succeed ----
 
         if new_computed_blocks or num_lower_tier_tokens:
@@ -299,13 +337,28 @@ class TieredKVCacheManager:
             if num_lower_tier_tokens:
                 self._charge_recall(req)
 
+        # Keep the source snapshot alive until private working state has been
+        # allocated. Its temporary pin fits in the reserved checkpoint capacity;
+        # it is released before allocating the destination checkpoint slots.
+        self.npu_pool.touch(checkpoint)
         self._allocate_state_blocks(req)
+        self.npu_pool.free_blocks(checkpoint)
+        if self.state_checkpoint_blocks:
+            old = self.req_to_checkpoint_blocks.get(req.id, [])
+            # Keep the previous aligned snapshot immutable while working state
+            # advances inside the next block. Rotate only for a new boundary.
+            if not old or (num_tokens_need_slot % self.block_size == 0
+                           and any(block.block_hash is not None for block in old)):
+                self.npu_pool.free_blocks(old)
+                self.req_to_checkpoint_blocks[req.id] = self.npu_pool.get_new_blocks(
+                    self.state_checkpoint_blocks)
         new_blocks = self._allocate_new_blocks(req, num_tokens_need_slot)
 
         if self.enable_caching:
             # Cap at the reached length: only finalised tokens may be indexed.
             self.cache_blocks(
-                req, min(total_computed + num_new_tokens, req.num_tokens_reached))
+                req, min(total_computed + num_new_tokens, req.num_tokens_reached),
+                completed=False)
         return new_blocks
 
     def _allocate_state_blocks(self, req):
@@ -343,17 +396,29 @@ class TieredKVCacheManager:
 
     # -------------------- caching --------------------
 
-    def cache_blocks(self, req, num_tokens):
+    def cache_blocks(self, req, num_tokens, *, completed=True):
         """Index every block of ``req`` that is now full, then write down.
 
         Called from ``allocate_slots`` and again when a chunk completes, so it
         must be idempotent -- ``num_cached_block`` is what makes it so.
+        ``completed=False`` reserves token hashes only: recurrent checkpoints
+        become reusable exclusively after the forward has completed.
         """
         if not self.enable_caching:
             return
         hashes = request_block_hashes(req, self.block_size)
         if not hashes:
             return
+
+        if (self.state_checkpoint_blocks and completed and num_tokens > 0
+                and num_tokens % self.block_size == 0
+                and num_tokens // self.block_size <= len(hashes)):
+            # Only the state at the actual completed chunk end exists. A
+            # multi-block forward does not export its intermediate states, nor
+            # does a partial chunk export the state at its rounded-down end.
+            keys = self._checkpoint_hashes(hashes[num_tokens // self.block_size - 1])
+            self.npu_pool.cache_full_blocks(
+                keys, self.req_to_checkpoint_blocks[req.id], 0, len(keys))
 
         num_cached = self.num_cached_block.get(req.id, 0)
         num_full = min(num_tokens // self.block_size, len(hashes))
@@ -400,12 +465,14 @@ class TieredKVCacheManager:
         self.num_cached_block.pop(req.id, None)
         if blocks:
             self.npu_pool.free_blocks(reversed(blocks))
-        # The state goes back too, on preemption as well as completion: vLLM
-        # rebuilds a preempted sequence's recurrent state from the recomputed
-        # prefix, it does not keep it.
+        # Working state goes back too, on preemption as well as completion.
+        # Only an indexed immutable checkpoint can survive for prefix reuse.
         state = self.req_to_state_blocks.pop(req.id, [])
         if state:
             self.npu_pool.free_blocks(reversed(state))
+        checkpoint = self.req_to_checkpoint_blocks.pop(req.id, [])
+        if checkpoint:
+            self.npu_pool.free_blocks(reversed(checkpoint))
 
     def preempt(self, req):
         """Release a *running* request's blocks so someone else can use them.

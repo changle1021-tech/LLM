@@ -174,6 +174,23 @@ an error, not first-wins, including a matching filename alongside another file's
 alias. Check all claims before choosing a catalog; a file's own alias is not
 a second claimant.
 
+GLM-5.3-Flash is separate from GLM-5: its wrapper/text config types are
+`glm5_next` / `glm5_next_text`, served by `glm5_next.yaml`. The source config's
+text stack has 34 KDA and 11 MLA layers, three dense MLP layers and 42 MoE
+layers with 288 experts/top-8; its mHC path uses four streams with a
+first/last-layer trace schedule. Weight quantization is FP8, while KDA/MLA
+activations and projection weights are BF16; mHC mixing parameters are FP32.
+Source-derived config, stack, decoder prefix/TP,
+catalog and logical/cache sizing support is text-only. Without live GPU coverage
+and an acquired profile bundle, do not claim measured latency accuracy or
+end-to-end readiness; vision timing and MTP, PP and SP remain uncertified.
+Local NPU prefix reuse requires contiguous token KV and a complete KDA state
+checkpoint at the same completed block boundary. Reserve private working and
+immutable checkpoint state separately; never infer snapshots at intermediate
+or rounded-down chunk positions. The pool-aligned hit has no incomplete
+indexer tail to restore. CPU/CXL prefix storage and cross-instance sharing
+remain unsupported for this layout.
+
 **One layer-order form: `blocks:` + `shared:`.** `blocks:` is keyed by **axis**
 (`blocks.attn.<layer_types value>`, `blocks.sparse_attn.<same>` as an overlay,
 `blocks.mlp.dense|moe`) rather than by block name, because a layer's identity

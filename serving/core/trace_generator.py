@@ -11,6 +11,7 @@ from .utils import (
 import pandas as pd
 import yaml
 from .memory_model import calculate_sizes, kv_element_bytes
+from .glm5_next_geometry import MODEL_TYPES as GLM5_NEXT_TYPES, logical_sizes as glm5_next_sizes
 from .communication import dtype_bytes, vocab_shard_size, engram_tp_geometry, sequence_parallel_rows
 from .gate_function import GateRouter
 from .config_builder import get_device
@@ -1221,6 +1222,12 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, num_speculative_tokens=0,
                      dp_rank=0, dp_token_counts=(), dp_valid_token_counts=(), duration_replay_only=False):
+    if config.get('model_type') in GLM5_NEXT_TYPES:
+        if (pp_size != 1 or num_speculative_tokens or pd_type is not None
+                or enable_attn_offloading or pim_model is not None):
+            raise NotImplementedError('GLM-5.3 traces require PP1 without MTP, P/D or attention offload')
+        # The FP8 checkpoint's MLA/KDA and residual streams remain BF16.
+        fp = 2
     if dp_rank < 0 or (gate is not None and (dp_rank + 1) * max(local_ep, 1) > ep_total):
         raise ValueError("DP member's local expert ranks exceed the EP group")
     model_type = config.get('model_type')
@@ -1411,7 +1418,11 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
     # Size calculation uses the same canonical layer names.
-    if _is_contextual_profile(ctx):
+    if ctx.config.get('model_type') in GLM5_NEXT_TYPES:
+        rows = bctx.lm_head_len if category == 'per_sequence' else bctx.total_len
+        inp, wt, out = glm5_next_sizes(ctx.config, layer_name, rows,
+            ctx.tp_size, layer_num, ep=ctx.ep_total)
+    elif _is_contextual_profile(ctx):
         inp, wt, out = ctx.component_sizes.sizes_for(bctx, layer_name, source_role, layer_num)
     elif layer_name == 'attention':
         kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
@@ -1569,8 +1580,6 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     from .moe_execution import emit_native_components
     if emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag):
         return
-    if getattr(ctx, 'attention_sequence_parallel', False):
-        raise ValueError('Attention-wide SP requires matching native MoE component profiles')
     ep_total = ctx.ep_total
 
     # AG/RS comm size and MoE compute are the **same** quantity: the gathered

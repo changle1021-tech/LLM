@@ -20,6 +20,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   cache, ASTRA-Sim networking, heterogeneous and disaggregated systems, model
   architectures and workloads, and the research section lists all three
   LLMServingSim publications.
+- Add GLM-5.3-Flash's native model configuration, KDA/MLA and mHC catalog,
+  configuration-driven layer schedule, TP shape emulation and logical tensor/cache
+  sizing, with local NPU prefix reuse backed by aligned KDA state checkpoints
+  and private pooled-tail state. Preserve BF16 projection/activation and FP32
+  mixing/state precision inside the FP8 checkpoint. GPU coverage and a measured
+  profile bundle remain required before latency validation; vision, MTP, PP, SP
+  and CPU/CXL prefix storage or cross-instance sharing are outside this
+  text-only integration. See the
+  [model guide](https://llmservingsim.ai/docs/examples/model-families/sparse-attention#glm-53-flash-is-a-separate-text-path).
 - Record ns-3 port throughput and configured RDMA QP rates independently of
   packet tracing, with peer-node mapping and an offline interactive plotting
   command. Counter observation adds no simulator events. Retain the run with

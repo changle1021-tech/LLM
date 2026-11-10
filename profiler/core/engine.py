@@ -301,9 +301,35 @@ def _materialize_config(
     # already validated prefix schedule, never the original full-depth list.
     native_text = written.get("text_config", written)
     overrides = copy.deepcopy(overrides)
-    for key in ("linear_attn_config", "layer_types"):
+    glm = written.get("model_type") in ("glm5_next", "glm5_next_text")
+    schedule_keys = ("linear_attn_config", "layer_types")
+    if glm:
+        schedule_keys += ("mlp_layer_types", "indexer_types")
+    for key in schedule_keys:
         if key in overrides and key in native_text:
             overrides[key] = copy.deepcopy(native_text[key])
+    if glm:
+        # vLLM's GLM config folds legacy nested KDA fields over canonical
+        # scalars during construction. Keep both spellings synchronized so
+        # TP sharding or a user override survives a fresh native reload.
+        linear = native_text.get("linear_attn_config")
+        if linear is not None and not isinstance(linear, dict):
+            raise ValueError("GLM5Next linear_attn_config must be a mapping")
+        linear = {} if linear is None else linear
+        aliases = (("linear_num_heads", "num_heads"),
+                   ("linear_head_dim", "head_dim"),
+                   ("linear_conv_kernel_dim", "short_conv_kernel_size"),
+                   ("linear_lower_bound", "gate_lower_bound"))
+        for canonical, legacy in aliases:
+            if canonical in overrides:
+                native_text[canonical] = copy.deepcopy(overrides[canonical])
+                linear[legacy] = copy.deepcopy(overrides[canonical])
+            elif legacy in linear:
+                native_text[canonical] = copy.deepcopy(linear[legacy])
+        if linear:
+            native_text["linear_attn_config"] = linear
+            if "linear_attn_config" in overrides:
+                overrides["linear_attn_config"] = copy.deepcopy(linear)
     kwargs["hf_overrides"] = overrides
     if isinstance(inner, dict):
         for key, value in overrides.items():

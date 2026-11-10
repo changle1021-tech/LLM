@@ -1,0 +1,136 @@
+# GLM-5.3-Flash text backbone, reviewed against upstream vLLM v0.31.0.
+# Preserve the checkpoint's glm5_next wrapper and nested text_config.
+# Bindings describe native capture boundaries, not measured latency or accuracy.
+# Run live coverage in prefill/decode/mixed regimes before acquiring a bundle.
+# No TP-stable timing, MTP, vision, PP or sequence-parallel layout is asserted.
+model_types: [glm5_next, glm5_next_text]
+
+blocks:
+  attn:
+    linear_attention_initial:
+      pre_attn: [mhc_pre, kda_in_proj, kda_f_b_proj, kda_g_b_proj, kda_core, kda_o_norm]
+      post_attn: [kda_o_proj, mhc_fused_post_pre]
+    linear_attention:
+      pre_attn: [mhc_fused_post_pre, kda_in_proj, kda_f_b_proj, kda_g_b_proj, kda_core, kda_o_norm]
+      post_attn: [kda_o_proj, mhc_fused_post_pre]
+    full_attention_initial:
+      pre_attn: [mhc_pre, mla_in_proj, mla_qkv_norm, mla_q_b_proj, indexer_wq_b_proj, indexer_wk_weights_proj, indexer_glue, indexer, attention]
+      post_attn: [mla_o_proj, mhc_fused_post_pre]
+    full_attention:
+      pre_attn: [mhc_fused_post_pre, mla_in_proj, mla_qkv_norm, mla_q_b_proj, indexer_wq_b_proj, indexer_wk_weights_proj, indexer_glue, indexer, attention]
+      post_attn: [mla_o_proj, mhc_fused_post_pre]
+  mlp:
+    dense: [gate_up_proj, act_fn, down_proj]
+    moe: [moe]
+
+shared:
+  prologue: [embedding, mhc_expand]
+  head: [mhc_post, mhc_contract, final_layernorm, lm_head, sampler]
+
+# stack.py selects an initial attention block for the first decoder's mhc_pre.
+# The last decoder's post/contract appear once at the PP1 shared head.
+# Decoder norms are weights of the fused mHC calls, not independent work.
+catalog:
+  dense:
+    embedding: {vllm: VocabParallelEmbedding}
+    mhc_expand:
+      callable: {name: GlmHCExpand, kind: function, module: vllm.models.glm5next.common.model, attribute: hc_expand}
+      normalization: invocations
+    mhc_pre:
+      callable: {name: GlmHCPre, kind: method, owner: Glm5NextDecoderLayer, path: hc_pre}
+      normalization: invocations
+    mhc_fused_post_pre:
+      callable: {name: GlmHCFusedPostPre, kind: method, owner: Glm5NextDecoderLayer, path: hc_fused_post_pre}
+      normalization: invocations
+    mhc_post:
+      callable: {name: GlmHCPost, kind: method, owner: Glm5NextDecoderLayer, path: hc_post}
+      normalization: invocations
+    mhc_contract:
+      callable: {name: GlmHCContract, kind: function, module: vllm.models.glm5next.common.model, attribute: hc_contract}
+      normalization: invocations
+    kda_in_proj:
+      callable: {name: GlmKDAInput, kind: method, owner: Glm5NextLinearAttention, path: in_proj_qkvbfg_a.forward}
+      normalization: invocations
+    kda_f_b_proj:
+      callable: {name: GlmKDAGate, kind: method, owner: Glm5NextLinearAttention, path: f_b_proj.forward}
+      normalization: invocations
+    kda_g_b_proj:
+      callable: {name: GlmKDAOutputGate, kind: method, owner: Glm5NextLinearAttention, path: g_b_proj.forward}
+      normalization: invocations
+    kda_o_norm:
+      callable: {name: GlmKDANorm, kind: method, owner: Glm5NextLinearAttention, path: o_norm.forward}
+      normalization: invocations
+    kda_o_proj:
+      callable: {name: GlmKDAOutput, kind: method, owner: Glm5NextLinearAttention, path: o_proj.forward}
+      normalization: invocations
+      tp_output_reduction: all_reduce
+    mla_in_proj:
+      callable: {name: GlmMLAInput, kind: method, owner: Glm5NextMLAAttention, path: fused_qkv_a_proj.forward}
+      normalization: invocations
+    mla_qkv_norm:
+      callable: {name: GlmMLANorm, kind: function, module: vllm.model_executor.layers.mla, attribute: fused_q_kv_rmsnorm, within: Glm5NextMLAAttention}
+      normalization: invocations
+    mla_q_b_proj:
+      callable: {name: GlmMLAQuery, kind: method, owner: Glm5NextMLAAttention, path: q_b_proj.forward}
+      normalization: invocations
+    mla_o_proj:
+      callable: {name: GlmMLAOutput, kind: method, owner: Glm5NextMLAAttention, path: o_proj.forward}
+      normalization: invocations
+      tp_output_reduction: all_reduce
+    indexer_wq_b_proj:
+      callable: {name: GlmIndexQuery, kind: method, owner: Glm5NextMLAAttention, path: indexer.wq_b.forward}
+      normalization: invocations
+    indexer_wk_weights_proj:
+      callable: {name: GlmIndexKeyWeights, kind: method, owner: Glm5NextMLAAttention, path: indexer.wk_weights_proj.forward}
+      normalization: invocations
+    # Include raw FP32 head-weight GEMM, K norm, FWHT/Q quantization and
+    # compress-gate projection; exclude all separately bound descendants.
+    indexer_glue:
+      vllm: '*'
+      within: Indexer
+      not_within: [ReplicatedLinear, MergedColumnParallelLinear, SparseAttnIndexerKpool]
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: Glm5NextMLP
+      not_within: Glm5NextMoE
+      normalization: invocations
+    act_fn:
+      vllm: [SiluAndMulWithClamp, SiluAndMul]
+      within: Glm5NextMLP
+      not_within: Glm5NextMoE
+      normalization: invocations
+    down_proj:
+      vllm: RowParallelLinear
+      within: Glm5NextMLP
+      not_within: Glm5NextMoE
+      normalization: invocations
+    final_layernorm:
+      vllm: RMSNorm
+      within: Glm5NextModel
+      not_within: Glm5NextDecoderLayer
+      normalization: invocations
+  per_sequence:
+    lm_head: {vllm: LogitsProcessor, normalization: invocations}
+    sampler: {vllm: Sampler, normalization: invocations}
+  linear_attention:
+    kda_core:
+      callable: {name: GlmKDACore, kind: method, owner: Glm5NextLinearAttention, path: _forward}
+      normalization: invocations
+  attention:
+    indexer:
+      callable: {name: GlmIndexKpool, kind: method, owner: Glm5NextMLAAttention, path: indexer.indexer_op.forward}
+      normalization: invocations
+      key_saturates: false
+    attention:
+      vllm: MLAAttention
+      within: Glm5NextMLAAttention
+      normalization: invocations
+      # Pool tails, cache writes and backend preparation are part of this
+      # native boundary; do not inherit GLM-5's 2048-key lookup cap.
+      key_saturates: false
+  moe:
+    moe:
+      vllm: Glm5NextMoE
+      normalization: invocations
+      sequence_parallel: true
+      attention_sequence_parallel: true

@@ -153,6 +153,23 @@ hybrid stack's dense layers as MoE layers — invisible on Qwen3-30B-A3B, whose
 `mlp_only_layers` is empty, and wrong for DeepSeek-V3.2 and GLM-5, whose first
 three layers are dense.
 
+GLM-5.3-Flash is a separate text architecture, not another `glm_moe_dsa`
+checkpoint. Its `glm5_next` wrapper / `glm5_next_text` text config describes 45
+layers (34 KDA, 11 MLA), three dense MLP layers followed by 42 MoE layers, 288
+experts with top-8 routing, and four-stream mHC. The checkpoint weights are
+FP8-quantized; KDA/MLA activations and projection weights are BF16, and mHC
+mixing parameters are FP32. Current simulator
+additions cover text config/stack handling, TP shape emulation, logical
+tensor/cache sizing, and the first/last mHC trace schedule. There is no GPU
+coverage or acquired profile bundle, so no measured accuracy is claimed. Vision
+timing and MTP, PP, and SP execution are not certified.
+
+Local prefix caching uses completed KDA checkpoints at the same block boundary
+as the token KV hit. Set a block size divisible by `index_kpool * 32` and enable
+chunked prefill. The pooled tail remains private to each request; CPU/CXL prefix
+storage and cross-instance sharing are unsupported. See
+[prefix caching](../simulator/scheduling/prefix-caching.md#glm-53-recurrent-state-checkpoints).
+
 ## Examples
 
 ### Llama 3.1 8B (dense)

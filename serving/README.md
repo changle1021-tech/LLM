@@ -271,6 +271,21 @@ rules and both the profiler and the simulator import it. A uniform stack is the
 degenerate case: one entry per axis, one block built and replayed for every
 layer.
 
+GLM-5.3-Flash uses the separate `glm5_next` text catalog and a source-derived
+45-layer KDA/MLA and dense/MoE schedule. Its trace represents the four-stream
+mHC path, including the model's first/last-layer handling, and dedicated
+geometry formulas describe logical tensors and cache state. No performance
+bundle or GPU coverage is available, so this structural support does not
+establish measured latency accuracy. Vision timing and MTP, PP, and SP execution
+are not certified. Local NPU prefix reuse uses completed, aligned KDA state
+checkpoints alongside the token KV cache; chunked prefill is required.
+CPU/CXL prefix storage, cross-instance sharing, P/D and attention offload
+remain unsupported for this layout. See the
+[prefix-cache mechanics](../docs/docs/simulator/scheduling/prefix-caching.md#glm-53-recurrent-state-checkpoints).
+Cache formulas describe logical payloads, including a replicated pooled indexer
+and fixed KDA/tail state; allocator padding, workspaces and quantization-scale
+residency still need native capacity observations.
+
 Latencies come from the profiler's per-category CSVs under
 `profiler/perf/<hardware>/<model>/<variant>/tp<N>/` — `dense.csv` (keyed on
 `tokens`), `per_sequence.csv` (`sequences`), `attention.csv` (a 5D grid on

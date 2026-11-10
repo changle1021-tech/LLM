@@ -63,6 +63,8 @@ SHARD_FIELDS: list[str] = [
     "vocab_size",
     "linear_num_key_heads",
     "linear_num_value_heads",
+    # GLM5Next KDA has one head count for all Q/K/V and recurrent state.
+    "linear_num_heads",
 ]
 
 
@@ -415,7 +417,9 @@ class Blocks(BaseModel):
 
     Keys under ``attn`` are the values the model config uses (e.g.
     ``linear_attention`` / ``full_attention`` from ``layer_types``), so the
-    resolver can look a layer up directly.
+    resolver can look a layer up directly. A source-derived ``attn_block``
+    may select a different execution sequence, such as an initial mHC block,
+    without changing the layer's attention kernel type.
     """
     model_config = ConfigDict(extra="forbid")
 
